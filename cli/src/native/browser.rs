@@ -95,6 +95,42 @@ fn is_internal_chrome_target(url: &str) -> bool {
         || url.starts_with("devtools://")
 }
 
+fn is_stale_target_error(error: &str) -> bool {
+    error.contains("Target closed") || error.contains("not found")
+}
+
+fn choose_replacement_target<'a>(
+    targets: &'a [TargetInfo],
+    tracked_target_ids: &HashSet<&str>,
+    stale_target_id: &str,
+    browser_context_id: Option<&str>,
+) -> Option<&'a TargetInfo> {
+    targets
+        .iter()
+        .filter(|target| target.target_id != stale_target_id)
+        .filter(|target| !tracked_target_ids.contains(target.target_id.as_str()))
+        .find(|target| {
+            browser_context_id
+                .map(|context_id| target.browser_context_id.as_deref() == Some(context_id))
+                .unwrap_or(true)
+        })
+        .or_else(|| {
+            targets
+                .iter()
+                .filter(|target| target.target_id != stale_target_id)
+                .find(|target| {
+                    browser_context_id
+                        .map(|context_id| target.browser_context_id.as_deref() == Some(context_id))
+                        .unwrap_or(false)
+                })
+        })
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| target.target_id != stale_target_id)
+        })
+}
+
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
     let lower = error.to_lowercase();
@@ -127,6 +163,7 @@ pub struct PageInfo {
     pub url: String,
     pub title: String,
     pub target_type: String, // "page" or "webview"
+    pub browser_context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +409,7 @@ impl BrowserManager {
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                browser_context_id: None,
             });
             self.active_page_index = 0;
             self.enable_domains(&attach_result.session_id).await?;
@@ -395,6 +433,7 @@ impl BrowserManager {
                     url: target.url.clone(),
                     title: target.title.clone(),
                     target_type: target.target_type.clone(),
+                    browser_context_id: target.browser_context_id.clone(),
                 });
             }
 
@@ -420,6 +459,166 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
+        Ok(())
+    }
+
+    pub fn should_track_target(target: &TargetInfo) -> bool {
+        (target.target_type == "page" || target.target_type == "webview")
+            && !target.url.is_empty()
+            && !is_internal_chrome_target(&target.url)
+    }
+
+    pub fn update_page_from_target_info(&mut self, target: &TargetInfo) -> bool {
+        if let Some(page) = self
+            .pages
+            .iter_mut()
+            .find(|page| page.target_id == target.target_id)
+        {
+            page.url = target.url.clone();
+            page.title = target.title.clone();
+            page.target_type = target.target_type.clone();
+            page.browser_context_id = target.browser_context_id.clone();
+            return true;
+        }
+        false
+    }
+
+    async fn attach_page_target(&self, target: &TargetInfo) -> Result<PageInfo, String> {
+        let attach_result: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: target.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+
+        self.enable_domains(&attach_result.session_id).await?;
+
+        Ok(PageInfo {
+            target_id: target.target_id.clone(),
+            session_id: attach_result.session_id,
+            url: target.url.clone(),
+            title: target.title.clone(),
+            target_type: target.target_type.clone(),
+            browser_context_id: target.browser_context_id.clone(),
+        })
+    }
+
+    pub async fn attach_and_add_page(&mut self, target: &TargetInfo) -> Result<(), String> {
+        let page = self.attach_page_target(target).await?;
+        self.add_page(page);
+        Ok(())
+    }
+
+    pub async fn recover_active_page_if_stale(&mut self) -> Result<(), String> {
+        if self.pages.is_empty() {
+            return self.ensure_page().await;
+        }
+
+        let active_index = self.active_page_index;
+        let active_page = self
+            .pages
+            .get(active_index)
+            .cloned()
+            .ok_or_else(|| "No active page".to_string())?;
+
+        let probe = self
+            .client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": "location.href",
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                })),
+                Some(&active_page.session_id),
+            )
+            .await;
+
+        match probe {
+            Ok(value) => {
+                if let Some(url) = value
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .and_then(|value| value.as_str())
+                {
+                    if let Some(page) = self.pages.get_mut(active_index) {
+                        page.url = url.to_string();
+                    }
+                }
+                return Ok(());
+            }
+            Err(error) if is_stale_target_error(&error) => {}
+            Err(_) => return Ok(()),
+        }
+
+        let result: GetTargetsResult = self
+            .client
+            .send_command_typed("Target.getTargets", &json!({}), None)
+            .await?;
+        let targets: Vec<TargetInfo> = result
+            .target_infos
+            .into_iter()
+            .filter(Self::should_track_target)
+            .collect();
+        let live_target_ids: HashSet<&str> = targets
+            .iter()
+            .map(|target| target.target_id.as_str())
+            .collect();
+
+        self.pages
+            .retain(|page| live_target_ids.contains(page.target_id.as_str()));
+        let retained_active_pos = self
+            .pages
+            .iter()
+            .position(|page| page.target_id == active_page.target_id);
+
+        let tracked_target_ids: HashSet<&str> = self
+            .pages
+            .iter()
+            .map(|page| page.target_id.as_str())
+            .collect();
+        let replacement = choose_replacement_target(
+            &targets,
+            &tracked_target_ids,
+            &active_page.target_id,
+            active_page.browser_context_id.as_deref(),
+        )
+        .ok_or_else(|| "No replacement page target found".to_string())?;
+
+        let replacement_page = self.attach_page_target(replacement).await?;
+        let replacement_target_id = replacement_page.target_id.clone();
+
+        if let Some(index) = retained_active_pos {
+            self.pages[index] = replacement_page;
+            self.active_page_index = index;
+        } else {
+            let insert_index = active_index.min(self.pages.len());
+            self.pages.insert(insert_index, replacement_page);
+            self.active_page_index = insert_index;
+        }
+
+        // Drop any duplicate entry that may have been added by target lifecycle
+        // event handling before this recovery path ran.
+        let mut index = 0;
+        while index < self.pages.len() {
+            if index != self.active_page_index
+                && self.pages[index].target_id == replacement_target_id
+            {
+                self.pages.remove(index);
+                if index < self.active_page_index {
+                    self.active_page_index -= 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        self.update_active_page_if_needed();
+
         Ok(())
     }
 
@@ -675,6 +874,7 @@ impl BrowserManager {
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: None,
         });
         self.active_page_index = 0;
         self.enable_domains(&attach_result.session_id).await?;
@@ -749,6 +949,7 @@ impl BrowserManager {
             url: target_url.to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: None,
         });
         self.active_page_index = index;
 
@@ -1489,6 +1690,51 @@ mod tests {
         assert!(!is_internal_chrome_target("https://example.com"));
         assert!(!is_internal_chrome_target("http://localhost:3000"));
         assert!(!is_internal_chrome_target("about:blank"));
+    }
+
+    fn target(target_id: &str, url: &str, browser_context_id: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: target_id.to_string(),
+            target_type: "page".to_string(),
+            title: String::new(),
+            url: url.to_string(),
+            attached: None,
+            browser_context_id: browser_context_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_should_track_target_rejects_internal_and_empty_urls() {
+        assert!(BrowserManager::should_track_target(&target(
+            "page",
+            "https://example.com",
+            Some("ctx-a")
+        )));
+        assert!(!BrowserManager::should_track_target(&target(
+            "empty",
+            "",
+            Some("ctx-a")
+        )));
+        assert!(!BrowserManager::should_track_target(&target(
+            "devtools",
+            "devtools://devtools/bundled/inspector.html",
+            Some("ctx-a")
+        )));
+    }
+
+    #[test]
+    fn test_choose_replacement_target_prefers_untracked_same_context() {
+        let targets = vec![
+            target("old", "https://example.com/sign-in", Some("ctx-a")),
+            target("tracked", "https://example.org", Some("ctx-b")),
+            target("replacement", "https://example.com/chat/new", Some("ctx-a")),
+        ];
+        let tracked = HashSet::from(["tracked"]);
+
+        let result = choose_replacement_target(&targets, &tracked, "old", Some("ctx-a"))
+            .expect("replacement target");
+
+        assert_eq!(result.target_id, "replacement");
     }
 
     // -----------------------------------------------------------------------

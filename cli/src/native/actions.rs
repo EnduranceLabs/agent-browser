@@ -15,7 +15,7 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, ConsoleApiCalledEvent,
     CreateTargetResult, DispatchMouseEventParams, ExceptionThrownEvent, TargetCreatedEvent,
-    TargetDestroyedEvent,
+    TargetDestroyedEvent, TargetInfo, TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -359,14 +359,14 @@ impl DaemonState {
         recording::stop_recording_task(&mut self.recording_state).await
     }
 
-    fn drain_cdp_events(&mut self) -> (Vec<i64>, Vec<TargetCreatedEvent>, Vec<String>) {
+    fn drain_cdp_events(&mut self) -> (Vec<i64>, Vec<TargetInfo>, Vec<String>) {
         let rx = match self.event_rx.as_mut() {
             Some(rx) => rx,
             None => return (Vec::new(), Vec::new(), Vec::new()),
         };
 
         let mut pending_acks: Vec<i64> = Vec::new();
-        let mut new_targets: Vec<TargetCreatedEvent> = Vec::new();
+        let mut target_updates: Vec<TargetInfo> = Vec::new();
         let mut destroyed_targets: Vec<String> = Vec::new();
 
         loop {
@@ -378,17 +378,24 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if (te.target_info.target_type == "page"
-                                    || te.target_info.target_type == "webview")
-                                    && !te.target_info.url.is_empty()
-                                {
+                                if BrowserManager::should_track_target(&te.target_info) {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
                                         .is_none_or(|b| b.has_target(&te.target_info.target_id));
                                     if !already_tracked {
-                                        new_targets.push(te);
+                                        target_updates.push(te.target_info);
                                     }
+                                }
+                            }
+                            continue;
+                        }
+                        "Target.targetInfoChanged" => {
+                            if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
+                                event.params.clone(),
+                            ) {
+                                if BrowserManager::should_track_target(&te.target_info) {
+                                    target_updates.push(te.target_info);
                                 }
                             }
                             continue;
@@ -640,7 +647,7 @@ impl DaemonState {
             }
         }
 
-        (pending_acks, new_targets, destroyed_targets)
+        (pending_acks, target_updates, destroyed_targets)
     }
 }
 
@@ -663,7 +670,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .to_string();
 
     // Drain pending CDP events (console, errors, screencast frames, target lifecycle)
-    let (pending_acks, new_targets, destroyed_targets) = state.drain_cdp_events();
+    let (pending_acks, target_updates, destroyed_targets) = state.drain_cdp_events();
+    let had_target_lifecycle_events = !target_updates.is_empty() || !destroyed_targets.is_empty();
     if !pending_acks.is_empty() {
         if let Some(ref browser) = state.browser {
             if let Ok(session_id) = browser.active_session_id() {
@@ -681,42 +689,36 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    for te in &new_targets {
+    for target_info in &target_updates {
         if let Some(ref mut mgr) = state.browser {
-            let attach_result: Result<AttachToTargetResult, String> = mgr
-                .client
-                .send_command_typed(
-                    "Target.attachToTarget",
-                    &AttachToTargetParams {
-                        target_id: te.target_info.target_id.clone(),
-                        flatten: true,
-                    },
-                    None,
-                )
-                .await;
-            if let Ok(attach) = attach_result {
-                let _ = mgr.enable_domains_pub(&attach.session_id).await;
+            if mgr.update_page_from_target_info(target_info)
+                || mgr.has_target(&target_info.target_id)
+            {
+                continue;
+            }
 
-                // Install domain filter on new pages
-                let df = state.domain_filter.read().await;
-                if let Some(ref filter) = *df {
-                    let _ = network::install_domain_filter(
-                        &mgr.client,
-                        &attach.session_id,
-                        &filter.allowed_domains,
-                    )
-                    .await;
+            if mgr.attach_and_add_page(target_info).await.is_ok() {
+                if let Ok(session_id) = mgr.active_session_id() {
+                    // Install domain filter on new pages
+                    let df = state.domain_filter.read().await;
+                    if let Some(ref filter) = *df {
+                        let _ = network::install_domain_filter(
+                            &mgr.client,
+                            session_id,
+                            &filter.allowed_domains,
+                        )
+                        .await;
+                    }
                 }
-
-                mgr.add_page(super::browser::PageInfo {
-                    target_id: te.target_info.target_id.clone(),
-                    session_id: attach.session_id,
-                    url: te.target_info.url.clone(),
-                    title: te.target_info.title.clone(),
-                    target_type: te.target_info.target_type.clone(),
-                });
             }
         }
+    }
+
+    if had_target_lifecycle_events {
+        if let Some(ref mut mgr) = state.browser {
+            let _ = mgr.recover_active_page_if_stale().await;
+        }
+        state.update_stream_client().await;
     }
 
     // Hot-reload and check action policy
@@ -2974,6 +2976,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
             url: nav_url.clone(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: Some(context_id.clone()),
         });
 
         // Navigate to URL
@@ -4632,6 +4635,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         url: "about:blank".to_string(),
         title: String::new(),
         target_type: "page".to_string(),
+        browser_context_id: None,
     });
 
     if let Some(viewport) = cmd.get("viewport") {
