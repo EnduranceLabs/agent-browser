@@ -266,7 +266,7 @@ fn choose_replacement_target(
     current_target_id: Option<&str>,
     browser_context_id: Option<&str>,
 ) -> Option<TargetInfo> {
-    targets
+    let candidates: Vec<TargetInfo> = targets
         .into_iter()
         .filter(should_track_target)
         .filter(|target| {
@@ -274,11 +274,17 @@ fn choose_replacement_target(
                 .map(|id| target.target_id != id)
                 .unwrap_or(true)
         })
+        .collect();
+
+    candidates
+        .iter()
         .find(|target| {
             browser_context_id
                 .map(|context_id| target.browser_context_id.as_deref() == Some(context_id))
                 .unwrap_or(true)
         })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn should_track_target(target: &TargetInfo) -> bool {
@@ -402,6 +408,21 @@ mod tests {
                     Some("ctx-a"),
                 ),
                 target("new", "https://example.com/done", Some("ctx-a")),
+            ],
+            Some("old"),
+            Some("ctx-a"),
+        )
+        .expect("replacement target");
+
+        assert_eq!(result.target_id, "new");
+    }
+
+    #[test]
+    fn test_choose_replacement_target_falls_back_when_context_id_missing() {
+        let result = choose_replacement_target(
+            vec![
+                target("old", "https://example.com", Some("ctx-a")),
+                target("new", "https://example.com/done", None),
             ],
             Some("old"),
             Some("ctx-a"),
