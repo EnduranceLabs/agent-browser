@@ -174,18 +174,16 @@ pub fn spawn_recording_task(
 
             let screenshot = match result {
                 Ok(s) => s,
-                Err(e) => {
-                    if e.contains("Target closed") || e.contains("not found") {
-                        if let Ok(replacement) = attach_to_replacement_target(
-                            &client,
-                            target_id.as_deref(),
-                            browser_context_id.as_deref(),
-                        )
-                        .await
-                        {
-                            target_id = Some(replacement.target_id);
-                            session_id = replacement.session_id;
-                        }
+                Err(_) => {
+                    if let Ok(replacement) = attach_to_replacement_target(
+                        &client,
+                        target_id.as_deref(),
+                        browser_context_id.as_deref(),
+                    )
+                    .await
+                    {
+                        target_id = Some(replacement.target_id);
+                        session_id = replacement.session_id;
                     }
                     continue;
                 }
