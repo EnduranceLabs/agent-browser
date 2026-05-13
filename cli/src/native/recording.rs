@@ -7,7 +7,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 
 use super::cdp::client::CdpClient;
-use super::cdp::types::{CaptureScreenshotParams, CaptureScreenshotResult};
+use super::cdp::types::{
+    AttachToTargetParams, AttachToTargetResult, CaptureScreenshotParams, CaptureScreenshotResult,
+    GetTargetsResult, TargetInfo,
+};
 
 const CAPTURE_INTERVAL_MS: u64 = 100;
 const CAPTURE_FPS: u32 = 10;
@@ -125,11 +128,15 @@ fn build_ffmpeg_command(output_path: &str) -> tokio::process::Command {
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
     session_id: String,
+    target_id: Option<String>,
+    browser_context_id: Option<String>,
     output_path: String,
     shared_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
+        let mut session_id = session_id;
+        let mut target_id = target_id;
         let mut cancel_rx = std::pin::pin!(cancel_rx);
 
         let mut ffmpeg = build_ffmpeg_command(&output_path).spawn().map_err(|e| {
@@ -169,7 +176,16 @@ pub fn spawn_recording_task(
                 Ok(s) => s,
                 Err(e) => {
                     if e.contains("Target closed") || e.contains("not found") {
-                        break;
+                        if let Ok(replacement) = attach_to_replacement_target(
+                            &client,
+                            target_id.as_deref(),
+                            browser_context_id.as_deref(),
+                        )
+                        .await
+                        {
+                            target_id = Some(replacement.target_id);
+                            session_id = replacement.session_id;
+                        }
                     }
                     continue;
                 }
@@ -208,6 +224,90 @@ pub fn spawn_recording_task(
     })
 }
 
+struct ReplacementTarget {
+    target_id: String,
+    session_id: String,
+}
+
+async fn attach_to_replacement_target(
+    client: &CdpClient,
+    current_target_id: Option<&str>,
+    browser_context_id: Option<&str>,
+) -> Result<ReplacementTarget, String> {
+    let result: GetTargetsResult = client
+        .send_command_typed("Target.getTargets", &json!({}), None)
+        .await?;
+
+    let target =
+        choose_replacement_target(result.target_infos, current_target_id, browser_context_id)
+            .ok_or_else(|| "No replacement page target found".to_string())?;
+
+    let attach: AttachToTargetResult = client
+        .send_command_typed(
+            "Target.attachToTarget",
+            &AttachToTargetParams {
+                target_id: target.target_id.clone(),
+                flatten: true,
+            },
+            None,
+        )
+        .await?;
+
+    enable_recording_domains(client, &attach.session_id).await?;
+
+    Ok(ReplacementTarget {
+        target_id: target.target_id,
+        session_id: attach.session_id,
+    })
+}
+
+fn choose_replacement_target(
+    targets: Vec<TargetInfo>,
+    current_target_id: Option<&str>,
+    browser_context_id: Option<&str>,
+) -> Option<TargetInfo> {
+    targets
+        .into_iter()
+        .filter(should_track_target)
+        .filter(|target| {
+            current_target_id
+                .map(|id| target.target_id != id)
+                .unwrap_or(true)
+        })
+        .find(|target| {
+            browser_context_id
+                .map(|context_id| target.browser_context_id.as_deref() == Some(context_id))
+                .unwrap_or(true)
+        })
+}
+
+fn should_track_target(target: &TargetInfo) -> bool {
+    (target.target_type == "page" || target.target_type == "webview")
+        && !is_internal_chrome_target(&target.url)
+}
+
+fn is_internal_chrome_target(url: &str) -> bool {
+    url.starts_with("chrome://")
+        || url.starts_with("chrome-extension://")
+        || url.starts_with("devtools://")
+}
+
+async fn enable_recording_domains(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    client
+        .send_command_no_params("Page.enable", Some(session_id))
+        .await?;
+    client
+        .send_command_no_params("Runtime.enable", Some(session_id))
+        .await?;
+    let _ = client
+        .send_command_no_params("Runtime.runIfWaitingForDebugger", Some(session_id))
+        .await;
+    client
+        .send_command_no_params("Network.enable", Some(session_id))
+        .await?;
+    Ok(())
+}
+
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
     if let Some(tx) = state.cancel_tx.take() {
         let _ = tx.send(());
@@ -237,6 +337,17 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
 mod tests {
     use super::*;
 
+    fn target(target_id: &str, url: &str, browser_context_id: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: target_id.to_string(),
+            target_type: "page".to_string(),
+            title: String::new(),
+            url: url.to_string(),
+            attached: None,
+            browser_context_id: browser_context_id.map(str::to_string),
+        }
+    }
+
     #[test]
     fn test_recording_state_new() {
         let state = RecordingState::new();
@@ -262,6 +373,42 @@ mod tests {
         let result = recording_start(&mut state, "/tmp/test2.mp4");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already active"));
+    }
+
+    #[test]
+    fn test_choose_replacement_target_prefers_same_browser_context() {
+        let result = choose_replacement_target(
+            vec![
+                target("old", "https://example.com", Some("ctx-a")),
+                target("other", "https://example.org", Some("ctx-b")),
+                target("new", "https://example.com/done", Some("ctx-a")),
+            ],
+            Some("old"),
+            Some("ctx-a"),
+        )
+        .expect("replacement target");
+
+        assert_eq!(result.target_id, "new");
+    }
+
+    #[test]
+    fn test_choose_replacement_target_ignores_internal_chrome_targets() {
+        let result = choose_replacement_target(
+            vec![
+                target("old", "https://example.com", Some("ctx-a")),
+                target(
+                    "devtools",
+                    "devtools://devtools/bundled/inspector.html",
+                    Some("ctx-a"),
+                ),
+                target("new", "https://example.com/done", Some("ctx-a")),
+            ],
+            Some("old"),
+            Some("ctx-a"),
+        )
+        .expect("replacement target");
+
+        assert_eq!(result.target_id, "new");
     }
 
     #[test]

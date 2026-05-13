@@ -335,12 +335,16 @@ impl DaemonState {
         &mut self,
         client: Arc<CdpClient>,
         session_id: String,
+        target_id: Option<String>,
+        browser_context_id: Option<String>,
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let handle = recording::spawn_recording_task(
             client,
             session_id,
+            target_id,
+            browser_context_id,
             self.recording_state.output_path.clone(),
             shared_count.clone(),
             cancel_rx,
@@ -2890,7 +2894,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
-    let (client, new_session_id) = {
+    let (client, new_session_id, target_id, browser_context_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         let old_session_id = mgr.active_session_id()?.to_string();
 
@@ -2963,8 +2967,9 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         }
 
         // Add page and switch to it
+        let target_id = create_result.target_id.clone();
         mgr.add_page(super::browser::PageInfo {
-            target_id: create_result.target_id,
+            target_id: target_id.clone(),
             session_id: new_session_id.clone(),
             url: nav_url.clone(),
             title: String::new(),
@@ -2984,11 +2989,18 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
 
-        (mgr.client.clone(), new_session_id)
+        (mgr.client.clone(), new_session_id, target_id, context_id)
     };
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
-    state.start_recording_task(client, new_session_id).await?;
+    state
+        .start_recording_task(
+            client,
+            new_session_id,
+            Some(target_id),
+            Some(browser_context_id),
+        )
+        .await?;
 
     Ok(result)
 }
@@ -3009,8 +3021,9 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
 
     if let Some(ref browser) = state.browser {
         let session_id = browser.active_session_id()?.to_string();
+        let target_id = browser.active_target_id().ok().map(str::to_string);
         state
-            .start_recording_task(browser.client.clone(), session_id)
+            .start_recording_task(browser.client.clone(), session_id, target_id, None)
             .await?;
     }
 
@@ -4709,10 +4722,11 @@ async fn handle_video_start(cmd: &Value, state: &mut DaemonState) -> Result<Valu
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let target_id = mgr.active_target_id().ok().map(str::to_string);
 
     recording::recording_start(&mut state.recording_state, path)?;
     state
-        .start_recording_task(mgr.client.clone(), session_id)
+        .start_recording_task(mgr.client.clone(), session_id, target_id, None)
         .await?;
 
     Ok(json!({
