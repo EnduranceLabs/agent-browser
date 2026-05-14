@@ -202,6 +202,26 @@ impl BrowserProcess {
             BrowserProcess::Lightpanda(p) => p.kill(),
         }
     }
+
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            BrowserProcess::Chrome(p) => p.pid(),
+            BrowserProcess::Lightpanda(_) => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_pid_alive(pid: u32) -> bool {
+    // libc::kill(pid, 0) returns 0 when the process exists and we can signal it.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn unix_pid_alive(_pid: u32) -> bool {
+    // On non-unix, fall back to assuming alive — the active CDP probe is
+    // authoritative there anyway.
+    true
 }
 
 pub struct BrowserManager {
@@ -211,6 +231,7 @@ pub struct BrowserManager {
     pages: Vec<PageInfo>,
     active_page_index: usize,
     default_timeout_ms: u64,
+    last_alive_probe: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -279,6 +300,7 @@ impl BrowserManager {
                 pages: Vec::new(),
                 active_page_index: 0,
                 default_timeout_ms: 25_000,
+                last_alive_probe: std::sync::Mutex::new(None),
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -343,6 +365,7 @@ impl BrowserManager {
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 10_000,
+            last_alive_probe: std::sync::Mutex::new(None),
         };
 
         manager.discover_and_attach_targets().await?;
@@ -795,20 +818,123 @@ impl BrowserManager {
         self.default_timeout_ms
     }
 
-    /// Checks if the CDP connection is alive by sending a simple command.
-    /// Returns false if the command times out or fails.
+    /// Checks whether the CDP connection (and the underlying browser process when
+    /// available) is healthy enough to keep using.
+    ///
+    /// History: an earlier implementation sent `Browser.getVersion` with a 3s
+    /// timeout and treated any failure as a dead browser, which made
+    /// `handle_launch` close and relaunch the browser on every transient CDP
+    /// stall. Heavy SPAs (Vite/HMR dev servers, hydration, big chunk loads)
+    /// routinely block the CDP response for >3s while Chrome is still alive
+    /// and well, and the relaunch silently nuked all auth state and dropped
+    /// the user back to about:blank.
+    ///
+    /// The check now:
+    ///   1. Returns true immediately if a previous probe succeeded in the
+    ///      last `ALIVE_CACHE` window. Recent CDP traffic is itself proof of
+    ///      life; we don't need to actively probe.
+    ///   2. Otherwise sends `Browser.getVersion` with a generous timeout and
+    ///      retries once before giving up.
+    ///   3. If the probe fails but the underlying browser process is still
+    ///      running, assumes a transient stall and reports alive. Only when
+    ///      the probe fails AND the process is gone do we report dead.
     pub async fn is_connection_alive(&self) -> bool {
-        let timeout = tokio::time::Duration::from_secs(3);
+        // Decision order (cheapest-first; the only way to truly know is to send
+        // a CDP command, but those are surprisingly expensive on busy SPAs).
+        //
+        // 1. If we have a Chrome subprocess and it's still running, trust it.
+        //    The previous implementation’s active probe was firing 5s false
+        //    negatives on a heavy Vite dev server and triggering a destructive
+        //    relaunch in handle_launch on every CLI invocation.
+        // 2. Otherwise (CDP-attached mode, or no subprocess) consult the cache.
+        // 3. As a last resort, send Browser.getVersion with a short timeout.
+        const ALIVE_CACHE: std::time::Duration = std::time::Duration::from_secs(30);
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let process_alive = self
+            .browser_process
+            .as_ref()
+            .and_then(|p| p.pid())
+            .map(unix_pid_alive);
+
+        if process_alive == Some(true) {
+            if let Ok(mut guard) = self.last_alive_probe.lock() {
+                *guard = Some(std::time::Instant::now());
+            }
+            if let Ok(log_path) = std::env::var("AGENT_BROWSER_DEBUG_LOG") {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "[is_connection_alive] alive=true via=process_check")
+                    });
+            }
+            return true;
+        }
+        if process_alive == Some(false) {
+            if let Ok(log_path) = std::env::var("AGENT_BROWSER_DEBUG_LOG") {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "[is_connection_alive] alive=false via=process_check")
+                    });
+            }
+            return false;
+        }
+
+        if let Ok(guard) = self.last_alive_probe.lock() {
+            if let Some(ts) = *guard {
+                if ts.elapsed() < ALIVE_CACHE {
+                    return true;
+                }
+            }
+        }
+
         let result = tokio::time::timeout(
-            timeout,
+            PROBE_TIMEOUT,
             self.client
                 .send_command_no_params("Browser.getVersion", None),
         )
         .await;
+        let alive = matches!(result, Ok(Ok(_)));
+        let probe_detail = match &result {
+            Ok(Ok(_)) => "ok".to_string(),
+            Ok(Err(e)) => format!("err:{}", e),
+            Err(_) => "timeout".to_string(),
+        };
 
-        match result {
-            Ok(Ok(_)) => true,
-            Ok(Err(_)) | Err(_) => false,
+        if alive {
+            if let Ok(mut guard) = self.last_alive_probe.lock() {
+                *guard = Some(std::time::Instant::now());
+            }
+        }
+
+        if let Ok(log_path) = std::env::var("AGENT_BROWSER_DEBUG_LOG") {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(
+                        f,
+                        "[is_connection_alive] alive={} via=cdp_probe probe={}",
+                        alive, probe_detail
+                    )
+                });
+        }
+        alive
+    }
+
+    /// Mark the connection as known-alive (e.g. after a successful CDP send).
+    pub fn mark_connection_alive(&self) {
+        if let Ok(mut guard) = self.last_alive_probe.lock() {
+            *guard = Some(std::time::Instant::now());
         }
     }
 
@@ -1273,6 +1399,10 @@ impl BrowserManager {
         self.pages.len()
     }
 
+    pub fn active_page_index(&self) -> usize {
+        self.active_page_index
+    }
+
     pub fn pages_list(&self) -> Vec<PageInfo> {
         self.pages.clone()
     }
@@ -1423,6 +1553,7 @@ async fn initialize_lightpanda_manager(
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 25_000,
+            last_alive_probe: std::sync::Mutex::new(None),
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {

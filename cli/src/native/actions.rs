@@ -13,9 +13,8 @@ use super::browser::{BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CdpEvent, ConsoleApiCalledEvent,
-    CreateTargetResult, DispatchMouseEventParams, ExceptionThrownEvent, TargetCreatedEvent,
-    TargetDestroyedEvent, TargetInfo, TargetInfoChangedEvent,
+    CdpEvent, ConsoleApiCalledEvent, DispatchMouseEventParams, ExceptionThrownEvent,
+    TargetCreatedEvent, TargetDestroyedEvent, TargetInfo, TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -2896,113 +2895,58 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
-    let (client, new_session_id, target_id, browser_context_id) = {
+    // Record in place on the currently active page. The previous implementation
+    // created a fresh browser context for the recording and tried to copy
+    // cookies into it via Network.setCookies. That approach had two problems:
+    //
+    //   1. It only carried cookies — localStorage, sessionStorage, IndexedDB,
+    //      service workers, and any other client-side state were lost. Modern
+    //      SPAs (including Journal) store auth-adjacent state in localStorage
+    //      and rely on registered service workers, so the recording context
+    //      ended up in a half-authenticated state that immediately bounced
+    //      back to /sign-in.
+    //
+    //   2. Network.getAllCookies on a busy renderer can take several seconds.
+    //      During that wait the daemon socket exceeded the CLI's 30s read
+    //      timeout, the CLI retried up to 5x, and the daemon ended up
+    //      processing duplicate recording_start requests — each creating yet
+    //      another browser context.
+    //
+    // Since this implementation captures frames with `Page.captureScreenshot`
+    // (not Playwright's video API), we can simply record on the existing
+    // target. Optional navigation is performed in-place via `Page.navigate`.
+    let (client, session_id, target_id, browser_context_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let old_session_id = mgr.active_session_id()?.to_string();
+        let session_id = mgr.active_session_id()?.to_string();
+        let target_id = mgr.active_target_id().ok().map(|s| s.to_string());
+        let browser_context_id = mgr
+            .pages_list()
+            .get(mgr.active_page_index())
+            .and_then(|p| p.browser_context_id.clone());
 
-        // Capture current URL if no URL specified
-        let nav_url = if let Some(u) = recording_url {
-            u.to_string()
-        } else {
-            mgr.get_url()
-                .await
-                .unwrap_or_else(|_| "about:blank".to_string())
-        };
-
-        // Capture current cookies
-        let cookies_result = mgr
-            .client
-            .send_command_no_params("Network.getAllCookies", Some(&old_session_id))
-            .await
-            .ok();
-
-        // Create new browser context
-        let ctx_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
-        let context_id = ctx_result
-            .get("browserContextId")
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get browserContextId")?
-            .to_string();
-
-        // Create page in new context
-        let create_result: CreateTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
-                None,
-            )
-            .await?;
-
-        let attach_result: AttachToTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: create_result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        let new_session_id = attach_result.session_id.clone();
-        mgr.enable_domains_pub(&new_session_id).await?;
-
-        // Transfer cookies to new context
-        if let Some(ref cr) = cookies_result {
-            if let Some(cookie_arr) = cr.get("cookies").and_then(|v| v.as_array()) {
-                if !cookie_arr.is_empty() {
-                    let _ = mgr
-                        .client
-                        .send_command(
-                            "Network.setCookies",
-                            Some(json!({ "cookies": cookie_arr })),
-                            Some(&new_session_id),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Add page and switch to it
-        let target_id = create_result.target_id.clone();
-        mgr.add_page(super::browser::PageInfo {
-            target_id: target_id.clone(),
-            session_id: new_session_id.clone(),
-            url: nav_url.clone(),
-            title: String::new(),
-            target_type: "page".to_string(),
-            browser_context_id: Some(context_id.clone()),
-        });
-
-        // Navigate to URL
-        if nav_url != "about:blank" {
+        if let Some(url) = recording_url {
             let _ = mgr
                 .client
                 .send_command(
                     "Page.navigate",
-                    Some(json!({ "url": nav_url })),
-                    Some(&new_session_id),
+                    Some(json!({ "url": url })),
+                    Some(&session_id),
                 )
                 .await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        (mgr.client.clone(), new_session_id, target_id, context_id)
+        (
+            mgr.client.clone(),
+            session_id,
+            target_id,
+            browser_context_id,
+        )
     };
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
     state
-        .start_recording_task(
-            client,
-            new_session_id,
-            Some(target_id),
-            Some(browser_context_id),
-        )
+        .start_recording_task(client, session_id, target_id, browser_context_id)
         .await?;
 
     Ok(result)

@@ -162,15 +162,37 @@ pub fn spawn_recording_task(
             capture_beyond_viewport: None,
         };
 
+        // Bound each individual screenshot so a wedged renderer doesn't pin
+        // the capture loop forever (which would prevent recording_stop from
+        // finishing the ffmpeg flush). At 10 fps the inter-frame budget is
+        // 100 ms; anything past a couple of seconds is functionally a frame
+        // drop, so we time out, log nothing, and try the next tick.
+        const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => break,
                 _ = interval.tick() => {}
             }
 
-            let result: Result<CaptureScreenshotResult, _> = client
-                .send_command_typed("Page.captureScreenshot", &params, Some(&session_id))
-                .await;
+            // Keep cancel responsive even when the renderer stalls on a
+            // multi-second screenshot — selecting against cancel here lets
+            // recording_stop return promptly instead of blocking on
+            // `JoinHandle::await` while the loop awaits a hung CDP call.
+            let result: Result<CaptureScreenshotResult, _> = tokio::select! {
+                _ = &mut cancel_rx => break,
+                outcome = tokio::time::timeout(
+                    SCREENSHOT_TIMEOUT,
+                    client.send_command_typed::<_, CaptureScreenshotResult>(
+                        "Page.captureScreenshot",
+                        &params,
+                        Some(&session_id),
+                    ),
+                ) => match outcome {
+                    Ok(inner) => inner,
+                    Err(_) => Err("capture timeout".to_string()),
+                },
+            };
 
             let screenshot = match result {
                 Ok(s) => s,
@@ -320,11 +342,19 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
     let counter = state.shared_frame_count.take();
     let handle = state.capture_task.take();
 
+    // Cap how long we wait for the capture task to wind down. The task itself
+    // selects against the cancel channel between every screenshot, so it
+    // normally returns within one frame interval; if it doesn't (e.g. ffmpeg
+    // is buffering a final flush), we still want recording_stop to return so
+    // the CLI doesn't keep retrying.
+    const STOP_TASK_TIMEOUT: Duration = Duration::from_secs(8);
+
     let result = if let Some(h) = handle {
-        match h.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("Recording task panicked: {}", e)),
+        match tokio::time::timeout(STOP_TASK_TIMEOUT, h).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(e)) => Err(format!("Recording task panicked: {}", e)),
+            Err(_) => Err("Recording task did not finish within stop timeout".to_string()),
         }
     } else {
         Ok(())

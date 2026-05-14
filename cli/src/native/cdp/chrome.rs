@@ -17,6 +17,11 @@ impl ChromeProcess {
         let _ = self.child.wait();
     }
 
+    /// Returns the OS pid of the Chrome child, if any.
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
     /// Wait for Chrome to exit on its own (after Browser.close CDP command),
     /// falling back to kill() if it doesn't exit within the timeout.
     /// This allows Chrome to flush cookies and other state to the user-data-dir.
