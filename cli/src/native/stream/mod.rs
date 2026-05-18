@@ -3,6 +3,7 @@ pub(crate) mod chat;
 mod dashboard;
 mod discovery;
 mod http;
+mod sink;
 mod websocket;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
@@ -58,9 +59,12 @@ pub struct StreamServer {
     last_engine: Arc<RwLock<String>>,
     last_frame: Arc<RwLock<Option<String>>>,
     recording: Arc<Mutex<bool>>,
+    sink_url: Arc<RwLock<Option<String>>>,
+    sink_connected: Arc<Mutex<bool>>,
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cdp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sink_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StreamServer {
@@ -136,10 +140,58 @@ impl StreamServer {
     /// Update and broadcast the recording state.
     pub async fn set_recording(&self, active: bool, engine: &str) {
         *self.recording.lock().await = active;
+        if active && *self.screencasting.lock().await {
+            let client = self.client_slot.read().await.clone();
+            let session_id = self.cdp_session_id.read().await.clone();
+            if let Some(client) = client {
+                let _ = client
+                    .send_command_with_timeout(
+                        "Page.stopScreencast",
+                        None,
+                        session_id.as_deref(),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await;
+            }
+            *self.screencasting.lock().await = false;
+        }
         let connected = self.client_slot.read().await.is_some();
         let sc = *self.screencasting.lock().await;
         let (vw, vh) = self.viewport().await;
         self.broadcast_status(connected, sc, vw, vh, engine).await;
+        self.client_notify.notify_one();
+    }
+
+    /// Connect this stream to an outbound WebSocket sink. The sink receives the
+    /// same sanitized frame/status messages as local dashboard clients and
+    /// contributes stream demand, so CDP capture starts without exposing a
+    /// sandbox-local server.
+    pub async fn start_outbound_sink(&self, url: String) -> Result<(), String> {
+        if self.sink_task.lock().await.is_some() {
+            return Err("Outbound stream sink is already configured".to_string());
+        }
+
+        {
+            let mut guard = self.sink_url.write().await;
+            *guard = Some(url.clone());
+        }
+
+        let task = tokio::spawn(sink::outbound_sink_loop(
+            url,
+            self.frame_tx.clone(),
+            self.client_count.clone(),
+            self.client_notify.clone(),
+            self.sink_connected.clone(),
+            self.shutdown_tx.subscribe(),
+        ));
+        *self.sink_task.lock().await = Some(task);
+        Ok(())
+    }
+
+    pub async fn sink_status(&self) -> (Option<String>, bool) {
+        let url = self.sink_url.read().await.clone();
+        let connected = *self.sink_connected.lock().await;
+        (url, connected)
     }
 
     /// Shut down the accept loop and background CDP listener, releasing the bound port.
@@ -151,6 +203,18 @@ impl StreamServer {
         }
         if let Some(task) = self.cdp_task.lock().await.take() {
             let _ = task.await;
+        }
+        if let Some(task) = self.sink_task.lock().await.take() {
+            let mut task = task;
+            tokio::select! {
+                _ = &mut task => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    // Do not let a slow outbound TCP/TLS teardown keep stream
+                    // disable or daemon shutdown stuck.
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
         }
     }
 
@@ -187,6 +251,8 @@ impl StreamServer {
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let last_frame = Arc::new(RwLock::new(None::<String>));
         let recording = Arc::new(Mutex::new(false));
+        let sink_url = Arc::new(RwLock::new(None::<String>));
+        let sink_connected = Arc::new(Mutex::new(false));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let frame_tx_clone = frame_tx.clone();
@@ -272,9 +338,12 @@ impl StreamServer {
                 last_engine,
                 last_frame,
                 recording,
+                sink_url,
+                sink_connected,
                 shutdown_tx,
                 accept_task: Mutex::new(Some(accept_task)),
                 cdp_task: Mutex::new(Some(cdp_task)),
+                sink_task: Mutex::new(None),
             },
             client_slot,
         ))

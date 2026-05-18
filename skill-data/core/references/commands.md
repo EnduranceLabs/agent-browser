@@ -375,6 +375,15 @@ agent-browser network route '*' --abort --resource-type script       # Block scr
 agent-browser network route '*' --resource-type image,font --body '' # Stub images and fonts
 ```
 
+## Runtime browser preview stream
+
+```bash
+agent-browser stream status                                      # Show stream state and bound port
+agent-browser stream enable --port 9223                          # Bind a specific localhost port
+agent-browser stream enable --sink wss://receiver.example/session # Push sanitized frames to an outbound WebSocket receiver
+agent-browser stream disable                                     # Stop runtime streaming
+```
+
 ## Environment Variables
 
 ```bash

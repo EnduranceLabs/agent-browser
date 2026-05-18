@@ -161,6 +161,11 @@ pub async fn resolve_element_center(
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
 
+        if let Some(selector) = entry.selector.as_deref() {
+            let (x, y) = resolve_by_selector(client, effective_session_id, selector).await?;
+            return Ok((x, y, effective_session_id.to_string()));
+        }
+
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
             let result: Result<DomGetBoxModelResult, String> = client
@@ -227,6 +232,27 @@ pub async fn resolve_element_object_id(
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+
+        if let Some(selector) = entry.selector.as_deref() {
+            let js = build_find_element_js(selector);
+            let result: EvaluateResult = client
+                .send_command_typed(
+                    "Runtime.evaluate",
+                    &EvaluateParams {
+                        expression: js,
+                        return_by_value: Some(false),
+                        await_promise: Some(false),
+                    },
+                    Some(effective_session_id),
+                )
+                .await?;
+
+            let object_id = result
+                .result
+                .object_id
+                .ok_or_else(|| format!("Element not found: {}", selector))?;
+            return Ok((object_id, effective_session_id.to_string()));
+        }
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {

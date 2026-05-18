@@ -31,7 +31,7 @@ agent-browser pdf <path>              # Save page as PDF
 agent-browser snapshot                # Accessibility tree with refs
 agent-browser eval <js>               # Run JavaScript
 agent-browser connect <port|url>      # Connect to browser via CDP
-agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
+agent-browser stream enable [--port <port>] [--sink <ws-url>]  # Start runtime WebSocket streaming
 agent-browser stream status           # Show runtime streaming state and bound port
 agent-browser stream disable          # Stop runtime WebSocket streaming
 agent-browser close                   # Close browser (aliases: quit, exit)
@@ -275,11 +275,12 @@ When a JavaScript dialog (`alert`, `confirm`, `prompt`) is pending, all command 
 ```bash
 agent-browser stream enable           # Start runtime WebSocket streaming on an auto-selected port
 agent-browser stream enable --port 9223  # Bind a specific localhost port
+agent-browser stream enable --sink wss://receiver.example.com/session/abc  # Push frames to an outbound WebSocket receiver
 agent-browser stream status           # Show enabled state, port, browser connection, screencasting
 agent-browser stream disable          # Stop runtime streaming and remove the .stream metadata file
 ```
 
-Streaming is enabled automatically for all sessions. Use these commands to check status, re-enable on a specific port, or disable streaming.
+Streaming is enabled automatically for all sessions. Use these commands to check status, re-enable on a specific port, push frames to an outbound receiver, or disable streaming.
 
 ## Debug
 

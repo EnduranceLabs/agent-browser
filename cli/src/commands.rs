@@ -1014,10 +1014,29 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                             cmd["port"] = json!(port);
                             i += 2;
                         }
+                        "--sink" => {
+                            let value =
+                                rest.get(i + 1)
+                                    .ok_or_else(|| ParseError::MissingArguments {
+                                        context: "stream enable --sink".to_string(),
+                                        usage: "stream enable [--port <port>] [--sink <ws-url>]",
+                                    })?;
+                            if !(value.starts_with("ws://") || value.starts_with("wss://")) {
+                                return Err(ParseError::InvalidValue {
+                                    message: format!(
+                                        "Invalid sink URL: '{}' must start with ws:// or wss://",
+                                        value
+                                    ),
+                                    usage: "stream enable [--port <port>] [--sink <ws-url>]",
+                                });
+                            }
+                            cmd["sinkUrl"] = json!(value);
+                            i += 2;
+                        }
                         flag => {
                             return Err(ParseError::InvalidValue {
                                 message: format!("Unknown flag for stream enable: {}", flag),
-                                usage: "stream enable [--port <port>]",
+                                usage: "stream enable [--port <port>] [--sink <ws-url>]",
                             });
                         }
                     }
@@ -4486,6 +4505,26 @@ mod tests {
         let cmd = parse_command(&args("stream enable --port 9223"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "stream_enable");
         assert_eq!(cmd["port"], 9223);
+    }
+
+    #[test]
+    fn test_stream_enable_with_sink() {
+        let cmd = parse_command(
+            &args("stream enable --sink wss://example.com/agent-browser"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "stream_enable");
+        assert_eq!(cmd["sinkUrl"], "wss://example.com/agent-browser");
+    }
+
+    #[test]
+    fn test_stream_enable_rejects_non_websocket_sink() {
+        let result = parse_command(
+            &args("stream enable --sink https://example.com/agent-browser"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

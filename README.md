@@ -128,7 +128,7 @@ agent-browser pdf <path>              # Save as PDF
 agent-browser snapshot                # Accessibility tree with refs (best for AI)
 agent-browser eval <js>               # Run JavaScript (-b for base64, --stdin for piped input)
 agent-browser connect <port>          # Connect to browser via CDP
-agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
+agent-browser stream enable [--port <port>] [--sink <ws-url>]  # Start runtime WebSocket streaming
 agent-browser stream status           # Show runtime streaming state and bound port
 agent-browser stream disable          # Stop runtime WebSocket streaming
 agent-browser close                   # Close browser (aliases: quit, exit)
@@ -1144,14 +1144,16 @@ You can also manage streaming at runtime with `stream enable`, `stream disable`,
 
 ```bash
 agent-browser stream enable --port 9223   # Re-enable on a specific port
+agent-browser stream enable --sink wss://receiver.example.com/session/abc
 agent-browser stream disable              # Stop streaming for the session
 ```
 
 The WebSocket server streams the browser viewport and accepts input events.
+Use `--sink` to also push sanitized status/frame messages to an outbound WebSocket receiver. This is useful when agent-browser runs in a remote sandbox that can make outbound network connections but should not expose its local stream server.
 
 ### WebSocket Protocol
 
-Connect to `ws://localhost:9223` to receive frames and send input:
+Connect to `ws://localhost:9223` to receive frames and send input. Outbound sinks configured with `--sink` receive the same status and frame messages, but input messages are ignored on that pushed connection.
 
 **Receive frames:**
 

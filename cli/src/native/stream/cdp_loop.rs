@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
@@ -7,6 +8,58 @@ use crate::native::cdp::client::CdpClient;
 use crate::native::network;
 
 use super::timestamp_ms;
+
+async fn stop_preview_screencast(client: &CdpClient, session_id: Option<&str>) {
+    let _ = client
+        .send_command_with_timeout(
+            "Page.stopScreencast",
+            None,
+            session_id,
+            Duration::from_secs(2),
+        )
+        .await;
+}
+
+async fn start_preview_screencast(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    width: u32,
+    height: u32,
+) {
+    let _ = client
+        .send_command_with_timeout(
+            "Page.startScreencast",
+            Some(json!({
+                "format": "jpeg",
+                "quality": 80,
+                "maxWidth": width,
+                "maxHeight": height,
+                "everyNthFrame": 1,
+            })),
+            session_id,
+            Duration::from_secs(2),
+        )
+        .await;
+}
+
+async fn ack_preview_screencast_frame(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    screencast_session_id: i64,
+) {
+    let _ = client
+        .send_command_no_wait(
+            "Page.screencastFrameAck",
+            Some(json!({ "sessionId": screencast_session_id })),
+            session_id,
+        )
+        .await;
+}
+
+async fn restart_screencast(client: &CdpClient, session_id: Option<&str>, width: u32, height: u32) {
+    stop_preview_screencast(client, session_id).await;
+    start_preview_screencast(client, session_id, width, height).await;
+}
 
 /// Background task that subscribes to CDP events and broadcasts screencast frames in real-time.
 /// Also handles auto-start/stop of screencast based on WebSocket client count.
@@ -33,9 +86,7 @@ pub(super) async fn cdp_event_loop(
                     let session_id = cdp_session_id.read().await.clone();
                     if *screencasting.lock().await {
                         if let Some(ref client) = *client_slot.read().await {
-                            let _ = client
-                                .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                .await;
+                            stop_preview_screencast(client, session_id.as_deref()).await;
                         }
                         let mut sc = screencasting.lock().await;
                         *sc = false;
@@ -50,6 +101,27 @@ pub(super) async fn cdp_event_loop(
         let guard = client_slot.read().await;
 
         if count > 0 {
+            if *recording.lock().await {
+                if *screencasting.lock().await {
+                    let mut sc = screencasting.lock().await;
+                    *sc = false;
+                }
+                let eng = last_engine.read().await.clone();
+                let (vw, vh) = (*viewport_width.lock().await, *viewport_height.lock().await);
+                let status = json!({
+                    "type": "status",
+                    "connected": guard.is_some(),
+                    "screencasting": false,
+                    "viewportWidth": vw,
+                    "viewportHeight": vh,
+                    "engine": eng,
+                    "recording": true,
+                });
+                let _ = frame_tx.send(status.to_string());
+                drop(guard);
+                continue;
+            }
+
             if let Some(ref client) = *guard {
                 let mut event_rx = client.subscribe();
                 let client_arc = Arc::clone(client);
@@ -64,19 +136,7 @@ pub(super) async fn cdp_event_loop(
                 let supports_screencast = eng == "chrome";
 
                 if supports_screencast {
-                    let _ = client_arc
-                        .send_command(
-                            "Page.startScreencast",
-                            Some(json!({
-                                "format": "jpeg",
-                                "quality": 80,
-                                "maxWidth": vw,
-                                "maxHeight": vh,
-                                "everyNthFrame": 1,
-                            })),
-                            session_id.as_deref(),
-                        )
-                        .await;
+                    start_preview_screencast(&client_arc, session_id.as_deref(), vw, vh).await;
                 }
 
                 {
@@ -102,9 +162,7 @@ pub(super) async fn cdp_event_loop(
                             if changed.is_err() || *shutdown_rx.borrow() {
                                 if supports_screencast {
                                     let session_id = cdp_session_id.read().await.clone();
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
+                                    stop_preview_screencast(&client_arc, session_id.as_deref()).await;
                                 }
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
@@ -114,7 +172,32 @@ pub(super) async fn cdp_event_loop(
                         event = event_rx.recv() => {
                             match event {
                                 Ok(evt) => {
-                                    if evt.method == "Page.frameNavigated" {
+                                    if *recording.lock().await {
+                                        if evt.method == "Page.screencastFrame" {
+                                            // While recording, preview frames are supplied by
+                                            // the recorder. Do not ACK stream-server screencast
+                                            // frames here; ACKing keeps Chrome flooding CDP and
+                                            // can starve agent control commands.
+                                        }
+                                        let mut sc = screencasting.lock().await;
+                                        *sc = false;
+                                        client_notify.notify_one();
+                                        break;
+                                    }
+                                    if evt.method == "Page.frameStoppedLoading" {
+                                        if supports_screencast {
+                                            tokio::time::sleep(Duration::from_millis(250)).await;
+                                            restart_screencast(
+                                                &client_arc,
+                                                session_id.as_deref(),
+                                                vw,
+                                                vh,
+                                            )
+                                            .await;
+                                            let mut sc = screencasting.lock().await;
+                                            *sc = true;
+                                        }
+                                    } else if evt.method == "Page.frameNavigated" {
                                         if let Some(frame) = evt.params.get("frame") {
                                             let is_main = frame
                                                 .get("parentId")
@@ -141,11 +224,7 @@ pub(super) async fn cdp_event_loop(
                                         }
                                     } else if evt.method == "Page.screencastFrame" {
                                         if let Some(sid) = evt.params.get("sessionId").and_then(|v| v.as_i64()) {
-                                            let _ = client_arc.send_command(
-                                                "Page.screencastFrameAck",
-                                                Some(json!({ "sessionId": sid })),
-                                                evt.session_id.as_deref(),
-                                            ).await;
+                                            ack_preview_screencast_frame(&client_arc, evt.session_id.as_deref(), sid).await;
                                         }
 
                                         if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
@@ -225,9 +304,7 @@ pub(super) async fn cdp_event_loop(
                             let new_session_id = cdp_session_id.read().await.clone();
                             if count == 0 {
                                 if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
+                                    stop_preview_screencast(&client_arc, session_id.as_deref()).await;
                                 }
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
@@ -244,11 +321,16 @@ pub(super) async fn cdp_event_loop(
                             let new_vw = *viewport_width.lock().await;
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
-                            if client_changed || session_changed || viewport_changed {
-                                if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
+                            let recording_active = *recording.lock().await;
+                            let screencast_stopped = !*screencasting.lock().await;
+                            if client_changed
+                                || session_changed
+                                || viewport_changed
+                                || recording_active
+                                || screencast_stopped
+                            {
+                                if supports_screencast && !recording_active {
+                                    stop_preview_screencast(&client_arc, session_id.as_deref()).await;
                                 }
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
@@ -266,9 +348,7 @@ pub(super) async fn cdp_event_loop(
             if was_screencasting {
                 if let Some(ref client) = *guard {
                     let session_id = cdp_session_id.read().await.clone();
-                    let _ = client
-                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                        .await;
+                    stop_preview_screencast(client, session_id.as_deref()).await;
                 }
                 let mut sc = screencasting.lock().await;
                 *sc = false;
@@ -287,7 +367,7 @@ pub async fn start_screencast(
     max_height: i32,
 ) -> Result<(), String> {
     client
-        .send_command(
+        .send_command_with_timeout(
             "Page.startScreencast",
             Some(json!({
                 "format": format,
@@ -297,6 +377,7 @@ pub async fn start_screencast(
                 "everyNthFrame": 1,
             })),
             Some(session_id),
+            Duration::from_secs(2),
         )
         .await?;
     Ok(())
@@ -304,7 +385,12 @@ pub async fn start_screencast(
 
 pub async fn stop_screencast(client: &CdpClient, session_id: &str) -> Result<(), String> {
     client
-        .send_command_no_params("Page.stopScreencast", Some(session_id))
+        .send_command_with_timeout(
+            "Page.stopScreencast",
+            None,
+            Some(session_id),
+            Duration::from_secs(2),
+        )
         .await?;
     Ok(())
 }
@@ -315,7 +401,7 @@ pub async fn ack_screencast_frame(
     screencast_session_id: i64,
 ) -> Result<(), String> {
     client
-        .send_command(
+        .send_command_no_wait(
             "Page.screencastFrameAck",
             Some(json!({ "sessionId": screencast_session_id })),
             Some(session_id),

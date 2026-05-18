@@ -121,10 +121,21 @@ fn format_stream_status_text(action: Option<&str>, data: &serde_json::Value) -> 
                 .get("screencasting")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let mut lines = vec![
+                format!("Streaming enabled on ws://127.0.0.1:{port}"),
+                format!("Connected: {connected}"),
+                format!("Screencasting: {screencasting}"),
+            ];
+            if let Some(sink_url) = data.get("sinkUrl").and_then(|v| v.as_str()) {
+                let sink_connected = data
+                    .get("sinkConnected")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                lines.push(format!("Sink: {sink_url}"));
+                lines.push(format!("Sink connected: {sink_connected}"));
+            }
 
-            Some(format!(
-                "Streaming enabled on ws://127.0.0.1:{port}\nConnected: {connected}\nScreencasting: {screencasting}"
-            ))
+            Some(lines.join("\n"))
         }
         _ => None,
     }
@@ -2619,17 +2630,19 @@ Examples:
 agent-browser stream - Manage live WebSocket browser streaming
 
 Usage:
-  agent-browser stream enable [--port <port>]
+  agent-browser stream enable [--port <port>] [--sink <ws-url>]
   agent-browser stream disable
   agent-browser stream status
 
 Enables or disables the session-scoped WebSocket stream server without restarting
 an already-running daemon. If --port is omitted, agent-browser binds an
 available localhost port automatically and reports it back.
+Use --sink to push the same sanitized stream messages to an outbound WebSocket.
 
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
+  - A configured outbound sink also triggers frame streaming automatically.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
@@ -2642,6 +2655,7 @@ Examples:
   agent-browser stream status
   agent-browser stream enable
   agent-browser stream enable --port 9223
+  agent-browser stream enable --sink wss://receiver.example.com/session/abc
   agent-browser stream disable
 "##
         }
@@ -3000,7 +3014,7 @@ Debug:
   clipboard <op> [text]      Read/write clipboard (read, write, copy, paste)
 
 Streaming:
-  stream enable [--port <n>] Start runtime WebSocket streaming for this session
+  stream enable [--port <n>] [--sink <ws-url>] Start runtime WebSocket streaming
   stream disable             Stop runtime WebSocket streaming
   stream status              Show streaming status and active port
 

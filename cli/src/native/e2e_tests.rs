@@ -4354,6 +4354,139 @@ async fn e2e_stream_frame_metadata_respects_custom_viewport() {
     let _ = std::fs::remove_dir_all(&socket_dir);
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_stream_continues_while_recording() {
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping recording stream e2e because ffmpeg is not installed");
+        return;
+    }
+
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-stream-recording-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-recording");
+
+    let mut state = DaemonState::new();
+    let recording_path = socket_dir.join("stream-recording.webm");
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let port = get_data(&resp)["port"]
+        .as_u64()
+        .expect("stream enable should report the bound port");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("websocket client should connect to runtime stream");
+
+    let html = r#"
+        <html>
+          <body style="margin:0;background:#101820;color:white;font:32px sans-serif">
+            <div id="box" style="width:160px;height:160px;background:#f04438;animation:move 1s infinite alternate"></div>
+            <script>
+              let i = 0;
+              setInterval(() => { document.body.dataset.tick = String(++i); }, 100);
+            </script>
+            <style>
+              @keyframes move { from { transform: translate(20px, 20px); } to { transform: translate(620px, 360px); } }
+            </style>
+          </body>
+        </html>
+    "#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "recording_start",
+            "path": recording_path.to_string_lossy(),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let mut saw_recording_status = false;
+    let mut saw_frame_while_recording = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(3), ws.next()).await;
+        let Some(Ok(message)) = msg.ok().flatten() else {
+            continue;
+        };
+        if !message.is_text() {
+            continue;
+        }
+        let parsed: Value =
+            serde_json::from_str(message.to_text().expect("text message should be readable"))
+                .expect("stream payload should be valid JSON");
+        if parsed.get("recording") == Some(&json!(true)) {
+            saw_recording_status = true;
+        }
+        if parsed.get("type") == Some(&json!("frame")) && saw_recording_status {
+            saw_frame_while_recording = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_recording_status,
+        "stream should publish recording=true status"
+    );
+    assert!(
+        saw_frame_while_recording,
+        "stream should continue publishing frames while recording"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "recording_stop" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        recording_path.exists(),
+        "recording_stop should leave a recording artifact"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "stream_disable" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
 /// Extract width and height from a JPEG's SOF0 (0xFFC0) or SOF2 (0xFFC2) marker.
 fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     for i in 0..data.len().saturating_sub(8) {

@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,6 +12,14 @@ use super::cdp::discovery::discover_cdp_url;
 use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
 use super::cdp::types::*;
 use super::element::{resolve_element_object_id, RefMap};
+
+fn default_browser_timeout_ms() -> u64 {
+    env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+        .or_else(|_| env::var("AGENT_BROWSER_TIMEOUT_MS"))
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(25_000)
+}
 
 // ---------------------------------------------------------------------------
 // Launch validation
@@ -391,7 +400,7 @@ impl BrowserManager {
                 ws_url,
                 pages: Vec::new(),
                 active_page_index: 0,
-                default_timeout_ms: 25_000,
+                default_timeout_ms: default_browser_timeout_ms(),
                 download_path: download_path.clone(),
                 ignore_https_errors,
                 visited_origins: HashSet::new(),
@@ -480,7 +489,7 @@ impl BrowserManager {
             ws_url,
             pages: Vec::new(),
             active_page_index: 0,
-            default_timeout_ms: 25_000,
+            default_timeout_ms: default_browser_timeout_ms(),
             download_path: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
@@ -628,21 +637,28 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
-        // Enable auto-attach for cross-origin iframe support.
-        // flatten: true gives each iframe its own session_id.
-        // Ignored on engines that don't support it (e.g. Lightpanda).
-        let _ = self
-            .client
-            .send_command(
-                "Target.setAutoAttach",
-                Some(json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": false,
-                    "flatten": true
-                })),
-                Some(session_id),
-            )
-            .await;
+        // Cross-origin iframe snapshots need secondary target sessions, but
+        // auto-attach can also attach service workers and other related targets.
+        // Keep it opt-in because heavy SPAs in constrained sandboxes are more
+        // reliable when the main page CDP session is not multiplexed with those.
+        if env::var("AGENT_BROWSER_ENABLE_TARGET_AUTO_ATTACH")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let _ = self
+                .client
+                .send_command(
+                    "Target.setAutoAttach",
+                    Some(json!({
+                        "autoAttach": true,
+                        "waitForDebuggerOnStart": false,
+                        "flatten": true
+                    })),
+                    Some(session_id),
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -681,16 +697,6 @@ impl BrowserManager {
             }
         }
 
-        // Active Page.startScreencast streams can make navigation responses
-        // unreliable on busy renderers. Stop briefly before route changes; the
-        // recorder listens for navigation lifecycle events and restarts capture.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(750),
-            self.client
-                .send_command_no_params("Page.stopScreencast", Some(&session_id)),
-        )
-        .await;
-
         let nav_result: PageNavigateResult = self
             .client
             .send_command_typed(
@@ -719,6 +725,58 @@ impl BrowserManager {
         let title = self.get_title().await.unwrap_or_default();
 
         // Track visited origin for cross-origin localStorage collection in save_state
+        if let Ok(parsed) = url::Url::parse(&page_url) {
+            let origin = parsed.origin().ascii_serialization();
+            if origin != "null" {
+                self.visited_origins.insert(origin);
+            }
+        }
+
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.url = page_url.clone();
+            page.title = title.clone();
+        }
+
+        Ok(json!({ "url": page_url, "title": title }))
+    }
+
+    pub async fn navigate_via_location(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+    ) -> Result<Value, String> {
+        let session_id = self.active_session_id()?.to_string();
+        let mut lifecycle_rx = self.client.subscribe();
+
+        if let Some(page) = self.pages.get(self.active_page_index) {
+            if page.url == url {
+                return Ok(json!({ "url": page.url, "title": page.title }));
+            }
+        }
+
+        let quoted_url = serde_json::to_string(url)
+            .map_err(|e| format!("Failed to serialize navigation URL: {}", e))?;
+        self.client
+            .send_command_with_timeout(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": format!("window.location.assign({}); undefined", quoted_url),
+                    "awaitPromise": false,
+                })),
+                Some(&session_id),
+                Duration::from_secs(3),
+            )
+            .await?;
+
+        if wait_until != WaitUntil::None {
+            let _ = self
+                .wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+                .await;
+        }
+
+        let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
+        let title = self.get_title().await.unwrap_or_default();
+
         if let Ok(parsed) = url::Url::parse(&page_url) {
             let origin = parsed.origin().ascii_serialization();
             if origin != "null" {
@@ -1493,6 +1551,73 @@ impl BrowserManager {
         update_page_target_info_in_pages(&mut self.pages, target)
     }
 
+    pub async fn active_session_is_responsive(&self, timeout: Duration) -> bool {
+        let Ok(session_id) = self.active_session_id() else {
+            return false;
+        };
+
+        self.client
+            .send_command_with_timeout(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": "1",
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                })),
+                Some(session_id),
+                timeout,
+            )
+            .await
+            .is_ok()
+    }
+
+    pub async fn reattach_active_page(&mut self) -> Result<(), String> {
+        let Some(active_page) = self.pages.get(self.active_page_index).cloned() else {
+            return Err("No active page".to_string());
+        };
+        let old_session_id = active_page.session_id.clone();
+
+        let attach_value = self
+            .client
+            .send_command_with_timeout(
+                "Target.attachToTarget",
+                Some(json!({
+                    "targetId": active_page.target_id,
+                    "flatten": true,
+                })),
+                None,
+                Duration::from_secs(5),
+            )
+            .await?;
+        let attach_result: AttachToTargetResult =
+            serde_json::from_value(attach_value).map_err(|e| {
+                format!(
+                    "Failed to deserialize CDP response for Target.attachToTarget: {}",
+                    e
+                )
+            })?;
+
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.session_id = attach_result.session_id.clone();
+        }
+
+        self.enable_domains(&attach_result.session_id).await?;
+
+        if !old_session_id.is_empty() && old_session_id != attach_result.session_id {
+            let _ = self
+                .client
+                .send_command_with_timeout(
+                    "Target.detachFromTarget",
+                    Some(json!({ "sessionId": old_session_id })),
+                    None,
+                    Duration::from_secs(2),
+                )
+                .await;
+        }
+
+        Ok(())
+    }
+
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             self.pages.remove(pos);
@@ -1669,7 +1794,7 @@ async fn initialize_lightpanda_manager(
             ws_url: ws_url.clone(),
             pages: Vec::new(),
             active_page_index: 0,
-            default_timeout_ms: 25_000,
+            default_timeout_ms: default_browser_timeout_ms(),
             download_path: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),

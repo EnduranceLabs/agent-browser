@@ -29,7 +29,7 @@ use super::network::{self, DomainFilter, EventTracker};
 use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
-use super::recording::{self, RecordingState};
+use super::recording::{self, RecordingControl, RecordingState};
 use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
@@ -312,6 +312,7 @@ impl DaemonState {
             launch_hash: None,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             default_timeout_ms: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+                .or_else(|_| env::var("AGENT_BROWSER_TIMEOUT_MS"))
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30_000),
@@ -566,6 +567,7 @@ impl DaemonState {
         browser_context_id: Option<String>,
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(RecordingControl::default());
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let handle = recording::spawn_recording_task(
             client,
@@ -575,6 +577,8 @@ impl DaemonState {
             self.recording_state.output_path.clone(),
             shared_count.clone(),
             cancel_rx,
+            self.stream_server.clone(),
+            control.clone(),
         );
 
         let warmup_deadline = tokio::time::Instant::now() + RECORDING_START_WARMUP_TIMEOUT;
@@ -592,6 +596,7 @@ impl DaemonState {
                 self.recording_state.active = false;
                 self.recording_state.shared_frame_count = None;
                 self.recording_state.cancel_tx = None;
+                self.recording_state.control = None;
                 return result;
             }
 
@@ -605,6 +610,7 @@ impl DaemonState {
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
         self.recording_state.cancel_tx = Some(cancel_tx);
+        self.recording_state.control = Some(control);
         Ok(())
     }
 
@@ -1183,6 +1189,147 @@ impl Drop for DaemonState {
     }
 }
 
+fn should_pause_recording_for_action(action: &str) -> bool {
+    !matches!(
+        action,
+        "" | "recording_start"
+            | "recording_stop"
+            | "recording_restart"
+            | "video_start"
+            | "video_stop"
+            | "stream_enable"
+            | "stream_disable"
+            | "stream_status"
+            | "screencast_start"
+            | "screencast_stop"
+            | "wait"
+            | "waitforurl"
+            | "waitforloadstate"
+            | "waitforfunction"
+            | "waitfordownload"
+            | "close"
+    )
+}
+
+fn recording_uses_screencast() -> bool {
+    matches!(
+        env::var("AGENT_BROWSER_RECORDING_SOURCE")
+            .unwrap_or_else(|_| "screencast".to_string())
+            .as_str(),
+        "screencast"
+    )
+}
+
+fn action_restarts_stream_screencast(action: &str) -> bool {
+    matches!(action, "navigate" | "back" | "forward" | "reload")
+}
+
+async fn pause_recording_for_command(action: &str, state: &mut DaemonState) -> bool {
+    if !state.recording_state.active || !should_pause_recording_for_action(action) {
+        return false;
+    }
+
+    let Some(control) = state.recording_state.control.clone() else {
+        return false;
+    };
+
+    if recording_uses_screencast() {
+        control.pause();
+        if let Some(mgr) = state.browser.as_ref() {
+            if let Some(session_id) = control.screencast_session_id() {
+                let _ = recording::stop_recording_screencast(&mgr.client, &session_id).await;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        return true;
+    }
+
+    control.pause();
+    tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
+    true
+}
+
+async fn resume_recording_after_command(action: &str, was_paused: bool, state: &mut DaemonState) {
+    if !was_paused {
+        return;
+    }
+
+    let Some(control) = state.recording_state.control.clone() else {
+        return;
+    };
+
+    control.resume();
+
+    if recording_uses_screencast() {
+        if state.recording_state.active {
+            if let Some(mgr) = state.browser.as_ref() {
+                if let Some(session_id) = control.screencast_session_id() {
+                    let _ = recording::start_recording_screencast(&mgr.client, &session_id).await;
+                }
+            }
+        }
+        return;
+    }
+
+    let should_restart =
+        !action_restarts_stream_screencast(action) || control.take_restart_requested();
+
+    if should_restart && state.recording_state.active && recording_uses_screencast() {
+        if let Some(mgr) = state.browser.as_ref() {
+            if let Ok(session_id) = mgr.active_session_id().map(str::to_string) {
+                let _ = recording::start_recording_screencast(&mgr.client, &session_id).await;
+            }
+        }
+    }
+}
+
+fn should_reattach_before_action(action: &str) -> bool {
+    matches!(
+        action,
+        "snapshot"
+            | "screenshot"
+            | "evaluate"
+            | "content"
+            | "gettext"
+            | "getattribute"
+            | "isvisible"
+            | "isenabled"
+            | "ischecked"
+            | "click"
+            | "dblclick"
+            | "fill"
+            | "type"
+            | "press"
+            | "hover"
+            | "scroll"
+    )
+}
+
+async fn reattach_active_page_before_command(action: &str, state: &mut DaemonState) {
+    if !should_reattach_before_action(action) {
+        return;
+    }
+    if let Some(mgr) = state.browser.as_mut() {
+        if mgr
+            .active_session_is_responsive(tokio::time::Duration::from_secs(2))
+            .await
+        {
+            return;
+        }
+
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            mgr.reattach_active_page(),
+        )
+        .await;
+        if let Some(server) = state.stream_server.as_ref() {
+            let session_id = mgr.active_session_id().ok().map(str::to_string);
+            server.set_cdp_session_id(session_id).await;
+            server.notify_client_changed();
+        }
+    }
+}
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let id = cmd
@@ -1313,6 +1460,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             ),
         );
     }
+
+    let recording_was_paused = pause_recording_for_command(action, state).await;
+    reattach_active_page_before_command(action, state).await;
 
     let result = match action {
         "launch" => handle_launch(cmd, state).await,
@@ -1480,6 +1630,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
+    resume_recording_after_command(action, recording_was_paused, state).await;
+
     let mut resp = match result {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
@@ -1511,12 +1663,23 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
         if let Some(ref mgr) = state.browser {
             server.broadcast_tabs(&mgr.tab_list()).await;
+            if success && action_restarts_stream_screencast(action) {
+                server.set_screencasting(false).await;
+            }
 
             // Keep the stream server's CDP session in sync with the active tab
             // so screencasting always targets the correct page.
             if matches!(
                 action,
-                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
+                "tab_new"
+                    | "tab_switch"
+                    | "tab_close"
+                    | "open"
+                    | "navigate"
+                    | "back"
+                    | "forward"
+                    | "reload"
+                    | "click"
             ) {
                 let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
                 server.set_cdp_session_id(session_id).await;
@@ -2259,6 +2422,8 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
+    let timeout_ms = state.timeout_ms(cmd);
+    let use_location_navigation = state.recording_state.active && recording_uses_screencast();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
     let wait_until = cmd
@@ -2312,7 +2477,22 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     state.ref_map.clear();
     state.iframe_sessions.clear();
     state.active_frame_id = None;
-    mgr.navigate(url, wait_until).await
+
+    if use_location_navigation {
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(timeout_ms),
+            mgr.navigate_via_location(url, wait_until),
+        )
+        .await
+        .map_err(|_| format!("Navigation timed out after {}ms", timeout_ms))?
+    } else {
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(timeout_ms),
+            mgr.navigate(url, wait_until),
+        )
+        .await
+        .map_err(|_| format!("Navigation timed out after {}ms", timeout_ms))?
+    }
 }
 
 async fn handle_url(state: &DaemonState) -> Result<Value, String> {
@@ -2506,7 +2686,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     };
 
     state.ref_map.clear();
-    let tree = snapshot::take_snapshot(
+    let snapshot_result = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
@@ -2514,9 +2694,15 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         state.active_frame_id.as_deref(),
         &state.iframe_sessions,
     )
-    .await?;
+    .await;
 
-    let url = mgr.get_url().await.unwrap_or_default();
+    let tree = snapshot_result?;
+
+    let url = tokio::time::timeout(tokio::time::Duration::from_secs(2), mgr.get_url())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
 
     let refs: serde_json::Map<String, Value> = state
         .ref_map
@@ -2714,6 +2900,19 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    if !mgr
+        .active_session_is_responsive(tokio::time::Duration::from_secs(2))
+        .await
+    {
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            mgr.reattach_active_page(),
+        )
+        .await;
+    }
 
     Ok(json!({ "clicked": selector }))
 }
@@ -4089,12 +4288,19 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     };
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
-    state
-        .start_recording_task(client, session_id, target_id, browser_context_id)
-        .await?;
-
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
+    }
+
+    if let Err(err) = state
+        .start_recording_task(client, session_id, target_id, browser_context_id)
+        .await
+    {
+        state.recording_state.active = false;
+        if let Some(ref server) = state.stream_server {
+            server.set_recording(false, &state.engine).await;
+        }
+        return Err(err);
     }
 
     Ok(result)
@@ -4124,6 +4330,9 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         let session_id = browser.active_session_id()?.to_string();
         let target_id = browser.active_target_id()?.to_string();
         let browser_context_id = browser.active_browser_context_id();
+        if let Some(ref server) = state.stream_server {
+            server.set_recording(true, &state.engine).await;
+        }
         state
             .start_recording_task(
                 browser.client.clone(),
@@ -5166,6 +5375,10 @@ async fn current_stream_status(state: &DaemonState) -> Value {
         Some(server) => server.is_screencasting().await,
         None => false,
     };
+    let (sink_url, sink_connected) = match state.stream_server.as_ref() {
+        Some(server) => server.sink_status().await,
+        None => (None, false),
+    };
 
     json!({
         "enabled": state.stream_server.is_some(),
@@ -5176,12 +5389,19 @@ async fn current_stream_status(state: &DaemonState) -> Value {
             .unwrap_or(Value::Null),
         "connected": connected,
         "screencasting": connected && (state.screencasting || runtime_screencasting),
+        "sinkUrl": sink_url,
+        "sinkConnected": sink_connected,
     })
 }
 
 async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     if state.stream_server.is_some() {
-        return Err("Streaming is already enabled for this session".to_string());
+        if let Some(sink_url) = cmd.get("sinkUrl").and_then(|value| value.as_str()) {
+            if let Some(server) = state.stream_server.as_ref() {
+                server.start_outbound_sink(sink_url.to_string()).await?;
+            }
+        }
+        return Ok(current_stream_status(state).await);
     }
 
     let requested_port = match cmd.get("port").and_then(|value| value.as_u64()) {
@@ -5193,6 +5413,9 @@ async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Va
     let (server, client_slot) =
         StreamServer::start_without_client(requested_port, state.session_id.clone(), false).await?;
     let port = server.port();
+    if let Some(sink_url) = cmd.get("sinkUrl").and_then(|value| value.as_str()) {
+        server.start_outbound_sink(sink_url.to_string()).await?;
+    }
     if let Err(err) = write_stream_file(&state.session_id, port) {
         server.shutdown().await;
         return Err(err);
@@ -8085,10 +8308,11 @@ mod tests {
             fs::read_to_string(&stream_path).expect("stream metadata file should exist");
         assert_eq!(port_file.trim(), port.to_string());
 
-        let duplicate_err = handle_stream_enable(&json!({}), &mut state)
+        let duplicate_status = handle_stream_enable(&json!({}), &mut state)
             .await
-            .expect_err("duplicate enable should fail");
-        assert!(duplicate_err.contains("already enabled"));
+            .expect("duplicate enable should return current status");
+        assert_eq!(duplicate_status["enabled"], true);
+        assert_eq!(duplicate_status["port"], port);
 
         let status = handle_stream_status(&state)
             .await

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -17,6 +19,31 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+
+fn trace_cdp(message: impl AsRef<str>) {
+    let Ok(path) = std::env::var("AGENT_BROWSER_CDP_TRACE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let line = format!("{} {}\n", now, message.as_ref());
+    if path == "stderr" {
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn should_trace_event(method: &str) -> bool {
+    method.starts_with("Target.")
+        || method.starts_with("Page.")
+        || method.starts_with("Runtime.executionContext")
+}
 
 /// Raw incoming CDP message (text) broadcast to all subscribers.
 /// Used by the inspect proxy to forward responses and events to DevTools.
@@ -151,10 +178,28 @@ impl CdpClient {
                     // Response to a command
                     let mut pending = pending_clone.lock().await;
                     if let Some(tx) = pending.remove(&id) {
+                        trace_cdp(format!(
+                            "RECV_RESPONSE id={} session={}",
+                            id,
+                            parsed.session_id.as_deref().unwrap_or("-")
+                        ));
                         let _ = tx.send(parsed);
                     }
                 } else if let Some(ref method) = parsed.method {
                     // Event
+                    if should_trace_event(method) {
+                        let compact_params = parsed
+                            .params
+                            .as_ref()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default();
+                        trace_cdp(format!(
+                            "RECV_EVENT method={} session={} params={}",
+                            method,
+                            parsed.session_id.as_deref().unwrap_or("-"),
+                            compact_params.chars().take(1000).collect::<String>()
+                        ));
+                    }
                     let event = CdpEvent {
                         method: method.clone(),
                         params: parsed.params.clone().unwrap_or(Value::Null),
@@ -209,6 +254,22 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.send_command_with_timeout(
+            method,
+            params,
+            session_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub async fn send_command_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -222,6 +283,13 @@ impl CdpClient {
             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
         let (tx, rx) = oneshot::channel();
+        let start = Instant::now();
+        trace_cdp(format!(
+            "SEND_COMMAND id={} method={} session={}",
+            id,
+            method,
+            session_id.unwrap_or("-")
+        ));
 
         {
             let mut pending = self.pending.lock().await;
@@ -230,22 +298,59 @@ impl CdpClient {
 
         {
             let mut ws_tx = self.ws_tx.lock().await;
-            ws_tx
-                .send(Message::Text(json))
-                .await
-                .map_err(|e| format!("Failed to send CDP command: {}", e))?;
+            if let Err(e) = ws_tx.send(Message::Text(json)).await {
+                self.pending.lock().await.remove(&id);
+                trace_cdp(format!(
+                    "SEND_ERROR id={} method={} elapsed_ms={} error={}",
+                    id,
+                    method,
+                    start.elapsed().as_millis(),
+                    e
+                ));
+                return Err(format!("Failed to send CDP command: {}", e));
+            }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => return Err("CDP response channel closed".to_string()),
+        let response = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => {
+                trace_cdp(format!(
+                    "DONE_COMMAND id={} method={} elapsed_ms={}",
+                    id,
+                    method,
+                    start.elapsed().as_millis()
+                ));
+                resp
+            }
+            Ok(Err(_)) => {
+                trace_cdp(format!(
+                    "CHANNEL_CLOSED id={} method={} elapsed_ms={}",
+                    id,
+                    method,
+                    start.elapsed().as_millis()
+                ));
+                return Err("CDP response channel closed".to_string());
+            }
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                trace_cdp(format!(
+                    "TIMEOUT_COMMAND id={} method={} session={} elapsed_ms={}",
+                    id,
+                    method,
+                    session_id.unwrap_or("-"),
+                    start.elapsed().as_millis()
+                ));
                 return Err(format!("CDP command timed out: {}", method));
             }
         };
 
         if let Some(error) = response.error {
+            trace_cdp(format!(
+                "ERROR_COMMAND id={} method={} elapsed_ms={} error={}",
+                id,
+                method,
+                start.elapsed().as_millis(),
+                error
+            ));
             return Err(format!("CDP error ({}): {}", method, error));
         }
 
@@ -292,6 +397,38 @@ impl CdpClient {
         session_id: Option<&str>,
     ) -> Result<Value, String> {
         self.send_command(method, None, session_id).await
+    }
+
+    pub async fn send_command_no_wait(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+        let cmd = CdpCommand {
+            id,
+            method: method.to_string(),
+            params,
+            session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        };
+
+        let json = serde_json::to_string(&cmd)
+            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+
+        trace_cdp(format!(
+            "SEND_COMMAND_NO_WAIT id={} method={} session={}",
+            id,
+            method,
+            session_id.unwrap_or("-")
+        ));
+
+        let mut ws_tx = self.ws_tx.lock().await;
+        ws_tx
+            .send(Message::Text(json))
+            .await
+            .map_err(|e| format!("Failed to send CDP command: {}", e))
     }
 
     /// Send raw JSON through the WebSocket without tracking a response.

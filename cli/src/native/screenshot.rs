@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use std::collections::HashMap;
 
@@ -9,6 +10,9 @@ use super::cdp::types::*;
 use super::element::RefMap;
 
 const ANNOTATION_OVERLAY_ID: &str = "__agent_browser_annotations__";
+const SCREENSHOT_CDP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_SCREENSHOT_SETTLE_MS: u64 = 500;
+const MAX_SCREENSHOT_SETTLE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 struct Rect {
@@ -175,6 +179,8 @@ async fn capture_screenshot_base64(
     options: &ScreenshotOptions,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
+    settle_before_screenshot().await;
+
     let mut params = CaptureScreenshotParams {
         format: Some(options.format.clone()),
         quality: if options.format == "jpeg" {
@@ -188,9 +194,12 @@ async fn capture_screenshot_base64(
     };
 
     if options.full_page {
-        let metrics: Value = client
-            .send_command_no_params("Page.getLayoutMetrics", Some(session_id))
-            .await?;
+        let metrics: Value = tokio::time::timeout(
+            SCREENSHOT_CDP_TIMEOUT,
+            client.send_command_no_params("Page.getLayoutMetrics", Some(session_id)),
+        )
+        .await
+        .map_err(|_| "Timed out while reading page layout metrics".to_string())??;
 
         let content_size = metrics
             .get("contentSize")
@@ -221,11 +230,29 @@ async fn capture_screenshot_base64(
         }
     }
 
-    let result: CaptureScreenshotResult = client
-        .send_command_typed("Page.captureScreenshot", &params, Some(session_id))
-        .await?;
+    let result: CaptureScreenshotResult = tokio::time::timeout(
+        SCREENSHOT_CDP_TIMEOUT,
+        client.send_command_typed("Page.captureScreenshot", &params, Some(session_id)),
+    )
+    .await
+    .map_err(|_| {
+        "Timed out while capturing screenshot; wait for the page to finish rendering and retry"
+            .to_string()
+    })??;
 
     Ok(result.data)
+}
+
+async fn settle_before_screenshot() {
+    let delay_ms = std::env::var("AGENT_BROWSER_SCREENSHOT_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCREENSHOT_SETTLE_MS)
+        .min(MAX_SCREENSHOT_SETTLE_MS);
+
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
 async fn collect_annotations(

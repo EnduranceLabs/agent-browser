@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::env;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -7,6 +9,8 @@ use super::cdp::types::{
     AXNode, AXProperty, AXValue, EvaluateParams, EvaluateResult, GetFullAXTreeResult,
 };
 use super::element::{resolve_ax_session, RefMap};
+
+const SNAPSHOT_CDP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const INTERACTIVE_ROLES: &[&str] = &[
     "button",
@@ -221,67 +225,127 @@ pub async fn take_snapshot(
     frame_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
-    client
-        .send_command_no_params("DOM.enable", Some(session_id))
-        .await?;
-    client
-        .send_command_no_params("Accessibility.enable", Some(session_id))
-        .await?;
+    let result = take_snapshot_inner(
+        client,
+        session_id,
+        options,
+        ref_map,
+        frame_id,
+        iframe_sessions,
+    )
+    .await;
+    cleanup_snapshot_domains(client, session_id, frame_id, iframe_sessions).await;
+    result
+}
+
+async fn cleanup_snapshot_domains(
+    client: &CdpClient,
+    session_id: &str,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+) {
+    let (_, effective_session_id) = resolve_ax_session(frame_id, session_id, iframe_sessions);
+    let _ = client
+        .send_command_with_timeout(
+            "Accessibility.disable",
+            None,
+            Some(effective_session_id),
+            Duration::from_secs(1),
+        )
+        .await;
+    let _ = client
+        .send_command_with_timeout(
+            "DOM.disable",
+            None,
+            Some(effective_session_id),
+            Duration::from_secs(1),
+        )
+        .await;
+}
+
+async fn take_snapshot_inner(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<String, String> {
+    if options.interactive && options.selector.is_none() && !options.urls && frame_id.is_none() {
+        if let Ok(output) =
+            take_fast_interactive_snapshot(client, session_id, options, ref_map).await
+        {
+            return Ok(output);
+        }
+    }
+
+    let _ = client
+        .send_command_with_timeout(
+            "Accessibility.enable",
+            None,
+            Some(session_id),
+            Duration::from_secs(2),
+        )
+        .await;
 
     // If a CSS selector is provided, resolve the set of backendNodeIds that
     // belong to the DOM subtree rooted at the matched element.  We use this
     // set to pick the right AX subtree root(s) later.
-    let selector_backend_ids: Option<std::collections::HashSet<i64>> =
-        if let Some(ref selector) = options.selector {
-            let js = format!(
-                "document.querySelector({})",
-                serde_json::to_string(selector).unwrap_or_default()
-            );
-            let result: EvaluateResult = client
-                .send_command_typed(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(false),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await?;
+    let selector_backend_ids: Option<std::collections::HashSet<i64>> = if let Some(ref selector) =
+        options.selector
+    {
+        client
+            .send_command_with_timeout("DOM.enable", None, Some(session_id), Duration::from_secs(2))
+            .await?;
+        let js = format!(
+            "document.querySelector({})",
+            serde_json::to_string(selector).unwrap_or_default()
+        );
+        let result: EvaluateResult = client
+            .send_command_typed(
+                "Runtime.evaluate",
+                &EvaluateParams {
+                    expression: js,
+                    return_by_value: Some(false),
+                    await_promise: Some(false),
+                },
+                Some(session_id),
+            )
+            .await?;
 
-            let object_id = result
-                .result
-                .object_id
-                .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
+        let object_id = result
+            .result
+            .object_id
+            .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
 
-            // Request the full DOM subtree (depth: -1) so we can collect all
-            // backendNodeIds that live under the matched element.
-            let describe: Value = client
-                .send_command(
-                    "DOM.describeNode",
-                    Some(serde_json::json!({ "objectId": object_id, "depth": -1 })),
-                    Some(session_id),
-                )
-                .await?;
+        // Request the full DOM subtree (depth: -1) so we can collect all
+        // backendNodeIds that live under the matched element.
+        let describe: Value = client
+            .send_command(
+                "DOM.describeNode",
+                Some(serde_json::json!({ "objectId": object_id, "depth": -1 })),
+                Some(session_id),
+            )
+            .await?;
 
-            let root_node = describe
-                .get("node")
-                .ok_or_else(|| format!("Could not resolve DOM node for selector '{}'", selector))?;
+        let root_node = describe
+            .get("node")
+            .ok_or_else(|| format!("Could not resolve DOM node for selector '{}'", selector))?;
 
-            let mut ids = std::collections::HashSet::new();
-            collect_backend_node_ids(root_node, &mut ids);
+        let mut ids = std::collections::HashSet::new();
+        collect_backend_node_ids(root_node, &mut ids);
 
-            if ids.is_empty() {
-                return Err(format!(
-                    "Could not resolve backendNodeId for selector '{}'",
-                    selector
-                ));
-            }
+        if ids.is_empty() {
+            return Err(format!(
+                "Could not resolve backendNodeId for selector '{}'",
+                selector
+            ));
+        }
 
-            Some(ids)
-        } else {
-            None
-        };
+        Some(ids)
+    } else {
+        None
+    };
 
     let (ax_params, effective_session_id) =
         resolve_ax_session(frame_id, session_id, iframe_sessions);
@@ -289,19 +353,50 @@ pub async fn take_snapshot(
     // in case the attach-time enable in execute_command was missed).
     if effective_session_id != session_id {
         let _ = client
-            .send_command_no_params("DOM.enable", Some(effective_session_id))
+            .send_command_with_timeout(
+                "DOM.enable",
+                None,
+                Some(effective_session_id),
+                Duration::from_secs(2),
+            )
             .await;
         let _ = client
-            .send_command_no_params("Accessibility.enable", Some(effective_session_id))
+            .send_command_with_timeout(
+                "Accessibility.enable",
+                None,
+                Some(effective_session_id),
+                Duration::from_secs(2),
+            )
             .await;
     }
-    let ax_tree: GetFullAXTreeResult = client
-        .send_command_typed(
+    let ax_tree_result = tokio::time::timeout(
+        SNAPSHOT_CDP_TIMEOUT,
+        client.send_command_typed(
             "Accessibility.getFullAXTree",
             &ax_params,
             Some(effective_session_id),
-        )
-        .await?;
+        ),
+    )
+    .await;
+
+    let ax_tree: GetFullAXTreeResult = match ax_tree_result {
+        Ok(Ok(tree)) => tree,
+        Ok(Err(err)) => {
+            if options.selector.is_none() && frame_id.is_none() {
+                return take_fast_interactive_snapshot(client, session_id, options, ref_map).await;
+            }
+            return Err(err);
+        }
+        Err(_) => {
+            if options.selector.is_none() && frame_id.is_none() {
+                return take_fast_interactive_snapshot(client, session_id, options, ref_map).await;
+            }
+            return Err(
+                "Timed out while reading the accessibility tree; wait for the page to finish rendering and retry"
+                    .to_string(),
+            );
+        }
+    };
 
     let (mut tree_nodes, root_indices) = build_tree(&ax_tree.nodes);
 
@@ -345,9 +440,17 @@ pub async fn take_snapshot(
 
     // Pre-collect cursor-interactive elements so we can mark them with refs during tree building
     let cursor_elements: HashMap<i64, CursorElementInfo> =
-        find_cursor_interactive_elements(client, session_id)
-            .await
-            .unwrap_or_default();
+        if env::var("AGENT_BROWSER_ENABLE_DOM_CURSOR_ENRICHMENT")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            find_cursor_interactive_elements(client, session_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
     promote_hidden_inputs(&mut tree_nodes, &cursor_elements);
 
@@ -504,7 +607,7 @@ pub async fn take_snapshot(
             if let Ok(child_fid) = resolve_iframe_frame_id(client, session_id, bid).await {
                 // Snapshot the child frame; errors are silently ignored
                 // (e.g. cross-origin iframes)
-                if let Ok(child_text) = Box::pin(take_snapshot(
+                if let Ok(child_text) = Box::pin(take_snapshot_inner(
                     client,
                     session_id,
                     options,
@@ -699,8 +802,9 @@ async fn find_cursor_interactive_elements(
 })()
 "#;
 
-    let result: EvaluateResult = client
-        .send_command_typed(
+    let result: EvaluateResult = tokio::time::timeout(
+        SNAPSHOT_CDP_TIMEOUT,
+        client.send_command_typed(
             "Runtime.evaluate",
             &EvaluateParams {
                 expression: js.to_string(),
@@ -708,8 +812,13 @@ async fn find_cursor_interactive_elements(
                 await_promise: Some(false),
             },
             Some(session_id),
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|_| {
+        "Timed out while finding cursor-interactive elements; wait for the page to finish rendering and retry"
+            .to_string()
+    })??;
 
     let elements: Vec<Value> = result
         .result
@@ -721,13 +830,18 @@ async fn find_cursor_interactive_elements(
         return Ok(HashMap::new());
     }
 
+    client
+        .send_command_with_timeout("DOM.enable", None, Some(session_id), Duration::from_secs(1))
+        .await?;
+
     // Batch-resolve backendNodeIds: use DOM.getDocument to get the root nodeId,
     // then DOM.querySelectorAll to get all tagged elements in a single call.
     let doc: Value = client
-        .send_command(
+        .send_command_with_timeout(
             "DOM.getDocument",
             Some(serde_json::json!({ "depth": 0 })),
             Some(session_id),
+            Duration::from_secs(1),
         )
         .await?;
 
@@ -738,13 +852,14 @@ async fn find_cursor_interactive_elements(
         .ok_or("DOM.getDocument did not return root nodeId")?;
 
     let query_result: Value = client
-        .send_command(
+        .send_command_with_timeout(
             "DOM.querySelectorAll",
             Some(serde_json::json!({
                 "nodeId": root_node_id,
                 "selector": "[data-__ab-ci]"
             })),
             Some(session_id),
+            Duration::from_secs(1),
         )
         .await?;
 
@@ -754,23 +869,20 @@ async fn find_cursor_interactive_elements(
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default();
 
-    // Resolve backendNodeIds for each DOM node using concurrent CDP calls.
-    let describe_futures: Vec<_> = node_ids
-        .iter()
-        .map(|&node_id| {
-            client.send_command(
+    // Build a map from data-__ab-ci index to backendNodeId.
+    let mut idx_to_backend: HashMap<usize, i64> = HashMap::new();
+    for node_id in node_ids.into_iter().take(200) {
+        let Ok(desc) = client
+            .send_command_with_timeout(
                 "DOM.describeNode",
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(session_id),
+                Duration::from_millis(250),
             )
-        })
-        .collect();
-
-    let describe_results = futures_util::future::join_all(describe_futures).await;
-
-    // Build a map from data-__ab-ci index to backendNodeId.
-    let mut idx_to_backend: HashMap<usize, i64> = HashMap::new();
-    for desc in describe_results.into_iter().flatten() {
+            .await
+        else {
+            continue;
+        };
         let backend_id = desc
             .get("node")
             .and_then(|n| n.get("backendNodeId"))
@@ -797,8 +909,9 @@ async fn find_cursor_interactive_elements(
     // Clean up the data attributes we injected for backendNodeId resolution.
     let cleanup_js =
         r#"(function(){ var els = document.querySelectorAll('[data-__ab-ci]'); for (var i = 0; i < els.length; i++) els[i].removeAttribute('data-__ab-ci'); return els.length; })()"#.to_string();
-    if let Err(e) = client
-        .send_command_typed::<EvaluateParams, EvaluateResult>(
+    if let Err(e) = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.send_command_typed::<EvaluateParams, EvaluateResult>(
             "Runtime.evaluate",
             &EvaluateParams {
                 expression: cleanup_js,
@@ -806,8 +919,11 @@ async fn find_cursor_interactive_elements(
                 await_promise: Some(false),
             },
             Some(session_id),
-        )
-        .await
+        ),
+    )
+    .await
+    .map_err(|_| "timed out".to_string())
+    .and_then(|result| result)
     {
         eprintln!("[agent-browser] Warning: failed to clean up data-__ab-ci attributes: {e}");
     }
@@ -889,6 +1005,343 @@ async fn find_cursor_interactive_elements(
     }
 
     Ok(map)
+}
+
+async fn take_fast_interactive_snapshot(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+) -> Result<String, String> {
+    let js = r#"
+(function() {
+    var results = [];
+    if (!document.body) return results;
+
+    var interactiveRoles = {
+        'button':1, 'link':1, 'textbox':1, 'checkbox':1, 'radio':1, 'combobox':1, 'listbox':1,
+        'menuitem':1, 'menuitemcheckbox':1, 'menuitemradio':1, 'option':1, 'searchbox':1,
+        'slider':1, 'spinbutton':1, 'switch':1, 'tab':1, 'treeitem':1
+    };
+    var interactiveTags = {
+        'a':1, 'button':1, 'input':1, 'select':1, 'textarea':1, 'details':1, 'summary':1
+    };
+    var allElements = document.body.querySelectorAll('*');
+    for (var i = 0; i < allElements.length && results.length < 500; i++) {
+        var el = allElements[i];
+        if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) continue;
+
+        var style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        var tagName = el.tagName.toLowerCase();
+        var roleAttr = (el.getAttribute('role') || '').toLowerCase();
+        var isNativeInteractive = !!interactiveTags[tagName];
+        var isRoleInteractive = !!interactiveRoles[roleAttr];
+        var hasCursorPointer = style.cursor === 'pointer';
+        var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
+        var tabIndex = el.getAttribute('tabindex');
+        var hasTabIndex = tabIndex !== null && tabIndex !== '-1';
+        var ce = el.getAttribute('contenteditable');
+        var isEditable = ce === '' || ce === 'true';
+
+        if (!isNativeInteractive && !isRoleInteractive && !hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) continue;
+        if (hasCursorPointer && !isNativeInteractive && !isRoleInteractive && !hasOnClick && !hasTabIndex && !isEditable) {
+            var parent = el.parentElement;
+            if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+        }
+
+        var index = results.length;
+        el.setAttribute('data-__ab-fast-snap', String(index));
+        results.push({
+            index: index,
+            tagName: tagName,
+            role: roleAttr,
+            type: (el.getAttribute('type') || '').toLowerCase(),
+            text: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 140),
+            ariaLabel: (el.getAttribute('aria-label') || '').trim(),
+            title: (el.getAttribute('title') || '').trim(),
+            placeholder: (el.getAttribute('placeholder') || '').trim(),
+            value: (typeof el.value === 'string' ? el.value : '').trim().slice(0, 140),
+            href: (typeof el.href === 'string' ? el.href : ''),
+            checked: typeof el.checked === 'boolean' ? String(el.checked) : null,
+            expanded: el.getAttribute('aria-expanded'),
+            selected: el.getAttribute('aria-selected'),
+            disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+            editable: isEditable,
+            cursor: hasCursorPointer,
+            onclick: hasOnClick,
+            tabindex: hasTabIndex
+        });
+    }
+    return results;
+})()
+"#;
+
+    let result: EvaluateResult = tokio::time::timeout(
+        SNAPSHOT_CDP_TIMEOUT,
+        client.send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: js.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        ),
+    )
+    .await
+    .map_err(|_| "Timed out while collecting interactive DOM elements".to_string())??;
+
+    let elements: Vec<Value> = result
+        .result
+        .value
+        .and_then(|v| serde_json::from_value::<Vec<Value>>(v).ok())
+        .unwrap_or_default();
+
+    if elements.is_empty() {
+        return Ok("(no interactive elements)".to_string());
+    }
+
+    let mut idx_to_backend: HashMap<usize, i64> = HashMap::new();
+
+    let doc_result = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.send_command(
+            "DOM.getDocument",
+            Some(serde_json::json!({ "depth": 0 })),
+            Some(session_id),
+        ),
+    )
+    .await;
+
+    if let Ok(Ok(doc)) = doc_result {
+        if let Some(root_node_id) = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(|v| v.as_i64())
+        {
+            let query_result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.send_command(
+                    "DOM.querySelectorAll",
+                    Some(serde_json::json!({
+                        "nodeId": root_node_id,
+                        "selector": "[data-__ab-fast-snap]"
+                    })),
+                    Some(session_id),
+                ),
+            )
+            .await;
+
+            if let Ok(Ok(query_result)) = query_result {
+                let node_ids: Vec<i64> = query_result
+                    .get("nodeIds")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+
+                for node_id in node_ids {
+                    let desc = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        client.send_command(
+                            "DOM.describeNode",
+                            Some(serde_json::json!({ "nodeId": node_id })),
+                            Some(session_id),
+                        ),
+                    )
+                    .await;
+
+                    let Ok(Ok(desc)) = desc else {
+                        continue;
+                    };
+
+                    let backend_id = desc
+                        .get("node")
+                        .and_then(|n| n.get("backendNodeId"))
+                        .and_then(|v| v.as_i64());
+                    let snap_attr = desc
+                        .get("node")
+                        .and_then(|n| n.get("attributes"))
+                        .and_then(|a| a.as_array())
+                        .and_then(|attrs| {
+                            attrs
+                                .iter()
+                                .enumerate()
+                                .find(|(_, v)| v.as_str() == Some("data-__ab-fast-snap"))
+                                .and_then(|(i, _)| attrs.get(i + 1))
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<usize>().ok())
+                        });
+                    if let (Some(bid), Some(idx)) = (backend_id, snap_attr) {
+                        idx_to_backend.insert(idx, bid);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut output = String::new();
+    let mut next_ref = ref_map.next_ref_num();
+
+    for (i, element) in elements.iter().enumerate() {
+        let role = infer_fast_interactive_role(element);
+        let name = infer_fast_interactive_name(element);
+        let ref_id = format!("e{}", next_ref);
+        next_ref += 1;
+
+        if let Some(backend_node_id) = idx_to_backend.get(&i).copied() {
+            ref_map.add_with_frame(
+                ref_id.clone(),
+                Some(backend_node_id),
+                &role,
+                &name,
+                None,
+                None,
+            );
+        } else {
+            ref_map.add_selector(
+                ref_id.clone(),
+                format!(r#"[data-__ab-fast-snap="{}"]"#, i),
+                &role,
+                &name,
+                None,
+            );
+        }
+
+        output.push_str("- ");
+        output.push_str(&role);
+        if !name.is_empty() {
+            output.push_str(" \"");
+            output.push_str(&sanitize_text(&name));
+            output.push('"');
+        }
+        if let Some(checked) = element.get("checked").and_then(|v| v.as_str()) {
+            output.push_str(&format!(" [checked={}]", checked));
+        }
+        if let Some(expanded) = element.get("expanded").and_then(|v| v.as_str()) {
+            output.push_str(&format!(" [expanded={}]", expanded));
+        }
+        if let Some(selected) = element.get("selected").and_then(|v| v.as_str()) {
+            output.push_str(&format!(" [selected={}]", selected));
+        }
+        if element
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            output.push_str(" [disabled]");
+        }
+        output.push_str(&format!(" [ref={}]", ref_id));
+
+        if options.depth.is_none_or(|depth| depth > 0) {
+            let mut hints = Vec::new();
+            if element
+                .get("cursor")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                hints.push("cursor:pointer");
+            }
+            if element
+                .get("onclick")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                hints.push("onclick");
+            }
+            if element
+                .get("tabindex")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                hints.push("tabindex");
+            }
+            if !hints.is_empty() {
+                output.push_str(" [");
+                output.push_str(&hints.join(", "));
+                output.push(']');
+            }
+        }
+
+        output.push('\n');
+    }
+
+    ref_map.set_next_ref_num(next_ref);
+
+    let trimmed = output.trim().to_string();
+    if trimmed.is_empty() {
+        Ok("(no interactive elements)".to_string())
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn infer_fast_interactive_role(element: &Value) -> String {
+    let role = element.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if !role.is_empty() {
+        return role.to_string();
+    }
+
+    let tag = element
+        .get("tagName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let input_type = element.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match tag {
+        "a" => "link",
+        "button" | "summary" => "button",
+        "select" => "combobox",
+        "textarea" => "textbox",
+        "input" => match input_type {
+            "checkbox" => "checkbox",
+            "radio" => "radio",
+            "range" => "slider",
+            "search" => "searchbox",
+            "button" | "submit" | "reset" => "button",
+            _ => "textbox",
+        },
+        _ => {
+            if element
+                .get("editable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "textbox"
+            } else {
+                "generic"
+            }
+        }
+    }
+    .to_string()
+}
+
+fn infer_fast_interactive_name(element: &Value) -> String {
+    for key in ["ariaLabel", "text", "title", "placeholder", "value"] {
+        let value = element
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
+fn sanitize_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !INVISIBLE_CHARS.contains(ch))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "\\\"")
 }
 
 /// Promote LabelText/generic nodes that wrap a hidden radio/checkbox input.
