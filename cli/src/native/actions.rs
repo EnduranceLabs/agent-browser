@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
@@ -570,6 +570,38 @@ impl DaemonState {
             shared_count.clone(),
             cancel_rx,
         );
+
+        let first_frame_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if shared_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+
+            if handle.is_finished() {
+                let result = match handle.await {
+                    Ok(Ok(())) => Err("Recording task ended before capturing a frame".to_string()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("Recording task panicked: {}", e)),
+                };
+                self.recording_state.active = false;
+                self.recording_state.shared_frame_count = None;
+                self.recording_state.cancel_tx = None;
+                return result;
+            }
+
+            if tokio::time::Instant::now() >= first_frame_deadline {
+                handle.abort();
+                let _ = handle.await;
+                self.recording_state.active = false;
+                self.recording_state.shared_frame_count = None;
+                self.recording_state.cancel_tx = None;
+                return Err("Recording did not capture an initial frame within 5s".to_string());
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
         self.recording_state.capture_task = Some(handle);
         self.recording_state.shared_frame_count = Some(shared_count);
         self.recording_state.cancel_tx = Some(cancel_tx);
