@@ -587,14 +587,14 @@ pub fn spawn_recording_task(
         .await;
 
         if let Some(frame) = capture_screenshot_frame(&client, &session_id).await {
-            let _ = frame_tx.send(frame);
+            write_frame(&mut stdin, &mut frame_writer, frame, shared_count.as_ref()).await?;
         }
 
         // Subscribe before starting screencast. Idle pages can emit a single
         // initial frame immediately, and missing it leaves ffmpeg with no seed
         // frame until the page changes again.
         let _ = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(2),
             start_screencast(&client, &session_id),
         )
         .await;

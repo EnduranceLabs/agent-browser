@@ -675,6 +675,22 @@ impl BrowserManager {
         let session_id = self.active_session_id()?.to_string();
         let mut lifecycle_rx = self.client.subscribe();
 
+        if let Some(page) = self.pages.get(self.active_page_index) {
+            if page.url == url {
+                return Ok(json!({ "url": page.url, "title": page.title }));
+            }
+        }
+
+        // Active Page.startScreencast streams can make navigation responses
+        // unreliable on busy renderers. Stop briefly before route changes; the
+        // recorder listens for navigation lifecycle events and restarts capture.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(750),
+            self.client
+                .send_command_no_params("Page.stopScreencast", Some(&session_id)),
+        )
+        .await;
+
         let nav_result: PageNavigateResult = self
             .client
             .send_command_typed(

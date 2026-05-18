@@ -41,6 +41,8 @@ use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSU
 use super::webdriver::ios;
 use super::webdriver::safari;
 
+const RECORDING_START_WARMUP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+
 /// Wait strategy used by `auth_login` when navigating to the login page.
 ///
 /// We intentionally use `Load` (instead of `NetworkIdle`) because many modern
@@ -575,17 +577,29 @@ impl DaemonState {
             cancel_rx,
         );
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        if handle.is_finished() {
-            let result = match handle.await {
-                Ok(Ok(())) => Err("Recording task ended immediately".to_string()),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(format!("Recording task panicked: {}", e)),
-            };
-            self.recording_state.active = false;
-            self.recording_state.shared_frame_count = None;
-            self.recording_state.cancel_tx = None;
-            return result;
+        let warmup_deadline = tokio::time::Instant::now() + RECORDING_START_WARMUP_TIMEOUT;
+        loop {
+            if shared_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
+
+            if handle.is_finished() {
+                let result = match handle.await {
+                    Ok(Ok(())) => Err("Recording task ended immediately".to_string()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("Recording task panicked: {}", e)),
+                };
+                self.recording_state.active = false;
+                self.recording_state.shared_frame_count = None;
+                self.recording_state.cancel_tx = None;
+                return result;
+            }
+
+            if tokio::time::Instant::now() >= warmup_deadline {
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
         self.recording_state.capture_task = Some(handle);
