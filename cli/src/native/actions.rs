@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
@@ -16,9 +16,9 @@ use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
-    DispatchMouseEventParams, ExceptionThrownEvent, JavascriptDialogOpeningEvent,
-    TargetCreatedEvent, TargetDestroyedEvent, TargetInfoChangedEvent,
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
+    ExceptionThrownEvent, JavascriptDialogOpeningEvent, TargetCreatedEvent, TargetDestroyedEvent,
+    TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -560,46 +560,32 @@ impl DaemonState {
         &mut self,
         client: Arc<CdpClient>,
         session_id: String,
+        target_id: Option<String>,
+        browser_context_id: Option<String>,
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let handle = recording::spawn_recording_task(
             client,
             session_id,
+            target_id,
+            browser_context_id,
             self.recording_state.output_path.clone(),
             shared_count.clone(),
             cancel_rx,
         );
 
-        let first_frame_deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            if shared_count.load(Ordering::Relaxed) > 0 {
-                break;
-            }
-
-            if handle.is_finished() {
-                let result = match handle.await {
-                    Ok(Ok(())) => Err("Recording task ended before capturing a frame".to_string()),
-                    Ok(Err(e)) => Err(e),
-                    Err(e) => Err(format!("Recording task panicked: {}", e)),
-                };
-                self.recording_state.active = false;
-                self.recording_state.shared_frame_count = None;
-                self.recording_state.cancel_tx = None;
-                return result;
-            }
-
-            if tokio::time::Instant::now() >= first_frame_deadline {
-                handle.abort();
-                let _ = handle.await;
-                self.recording_state.active = false;
-                self.recording_state.shared_frame_count = None;
-                self.recording_state.cancel_tx = None;
-                return Err("Recording did not capture an initial frame within 5s".to_string());
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if handle.is_finished() {
+            let result = match handle.await {
+                Ok(Ok(())) => Err("Recording task ended immediately".to_string()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("Recording task panicked: {}", e)),
+            };
+            self.recording_state.active = false;
+            self.recording_state.shared_frame_count = None;
+            self.recording_state.cancel_tx = None;
+            return result;
         }
 
         self.recording_state.capture_task = Some(handle);
@@ -708,6 +694,7 @@ impl DaemonState {
                         url: te.target_info.url.clone(),
                         title: te.target_info.title.clone(),
                         target_type: te.target_info.target_type.clone(),
+                        browser_context_id: te.target_info.browser_context_id.clone(),
                     });
                 }
             }
@@ -4069,146 +4056,28 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
-    let viewport = state.viewport;
-
-    let (client, new_session_id) = {
+    let (client, session_id, target_id, browser_context_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let old_session_id = mgr.active_session_id()?.to_string();
-
-        // Capture current URL if no URL specified
-        let nav_url = if let Some(u) = recording_url {
-            u.to_string()
-        } else {
-            mgr.get_url()
-                .await
-                .unwrap_or_else(|_| "about:blank".to_string())
-        };
-
-        // Capture current cookies
-        let cookies_result = mgr
-            .client
-            .send_command_no_params("Network.getAllCookies", Some(&old_session_id))
-            .await
-            .ok();
-
-        // Create new browser context
-        let ctx_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
-        let context_id = ctx_result
-            .get("browserContextId")
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get browserContextId")?
-            .to_string();
-
-        // Create page in new context
-        let create_result: CreateTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
-                None,
-            )
-            .await?;
-
-        let attach_result: AttachToTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: create_result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        let new_session_id = attach_result.session_id.clone();
-        mgr.enable_domains_pub(&new_session_id).await?;
-
-        // Re-apply download behavior to the recording context.
-        // Without this, downloads in the recording context are silently dropped
-        // because Browser.setDownloadBehavior at launch only applies to the default context.
-        if let Some(ref dl_path) = mgr.download_path {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Browser.setDownloadBehavior",
-                    Some(json!({
-                        "behavior": "allow",
-                        "downloadPath": dl_path,
-                        "browserContextId": context_id,
-                        "eventsEnabled": true
-                    })),
-                    None,
-                )
-                .await;
+        if let Some(url) = recording_url {
+            mgr.navigate(url, super::browser::WaitUntil::Load).await?;
         }
 
-        // Re-apply HTTPS error ignore to the recording context.
-        // Security.setIgnoreCertificateErrors at launch only applies to the session it was sent on.
-        if mgr.ignore_https_errors {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Security.setIgnoreCertificateErrors",
-                    Some(json!({ "ignore": true })),
-                    Some(&new_session_id),
-                )
-                .await;
-        }
+        let session_id = mgr.active_session_id()?.to_string();
+        let target_id = mgr.active_target_id()?.to_string();
+        let browser_context_id = mgr.active_browser_context_id();
 
-        // Transfer cookies to new context
-        if let Some(ref cr) = cookies_result {
-            if let Some(cookie_arr) = cr.get("cookies").and_then(|v| v.as_array()) {
-                if !cookie_arr.is_empty() {
-                    let _ = mgr
-                        .client
-                        .send_command(
-                            "Network.setCookies",
-                            Some(json!({ "cookies": cookie_arr })),
-                            Some(&new_session_id),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Add page and switch to it
-        let tab_id = mgr.assign_tab_id();
-        mgr.add_page(super::browser::PageInfo {
-            tab_id,
-            label: None,
-            target_id: create_result.target_id,
-            session_id: new_session_id.clone(),
-            url: nav_url.clone(),
-            title: String::new(),
-            target_type: "page".to_string(),
-        });
-
-        if let Some((w, h, scale, mobile)) = viewport {
-            let _ = mgr.set_viewport(w, h, scale, mobile).await;
-        }
-
-        // Navigate to URL
-        if nav_url != "about:blank" {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Page.navigate",
-                    Some(json!({ "url": nav_url })),
-                    Some(&new_session_id),
-                )
-                .await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        }
-
-        (mgr.client.clone(), new_session_id)
+        (
+            mgr.client.clone(),
+            session_id,
+            Some(target_id),
+            browser_context_id,
+        )
     };
 
     let result = recording::recording_start(&mut state.recording_state, path)?;
-    state.start_recording_task(client, new_session_id).await?;
+    state
+        .start_recording_task(client, session_id, target_id, browser_context_id)
+        .await?;
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
@@ -4239,8 +4108,15 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
 
     if let Some(ref browser) = state.browser {
         let session_id = browser.active_session_id()?.to_string();
+        let target_id = browser.active_target_id()?.to_string();
+        let browser_context_id = browser.active_browser_context_id();
         state
-            .start_recording_task(browser.client.clone(), session_id)
+            .start_recording_task(
+                browser.client.clone(),
+                session_id,
+                Some(target_id),
+                browser_context_id,
+            )
             .await?;
     }
 
@@ -6373,6 +6249,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         url: "about:blank".to_string(),
         title: String::new(),
         target_type: "page".to_string(),
+        browser_context_id: None,
     });
 
     if let Some(viewport) = cmd.get("viewport") {
@@ -6477,10 +6354,17 @@ async fn handle_video_start(cmd: &Value, state: &mut DaemonState) -> Result<Valu
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let target_id = mgr.active_target_id()?.to_string();
+    let browser_context_id = mgr.active_browser_context_id();
 
     recording::recording_start(&mut state.recording_state, path)?;
     state
-        .start_recording_task(mgr.client.clone(), session_id)
+        .start_recording_task(
+            mgr.client.clone(),
+            session_id,
+            Some(target_id),
+            browser_context_id,
+        )
         .await?;
 
     Ok(json!({

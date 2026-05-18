@@ -6,8 +6,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
+use super::browser::should_track_target;
 use super::cdp::client::CdpClient;
-use super::cdp::types::CdpEvent;
+use super::cdp::types::{
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, GetTargetsResult, TargetInfo,
+};
 
 const CAPTURE_FPS: u32 = 25;
 
@@ -234,9 +237,122 @@ fn is_main_frame_navigation(event: &CdpEvent) -> bool {
     }
 }
 
+fn target_event_matches(
+    event: &CdpEvent,
+    method: &str,
+    field: &str,
+    expected: Option<&str>,
+) -> bool {
+    event.method == method
+        && expected.is_some_and(|value| {
+            event
+                .params
+                .get(field)
+                .and_then(|v| v.as_str())
+                .is_some_and(|event_value| event_value == value)
+        })
+}
+
+fn should_recover_recording_target(
+    event: &CdpEvent,
+    session_id: &str,
+    target_id: Option<&str>,
+) -> bool {
+    (event.session_id.as_deref() == Some(session_id) && event.method == "Target.detachedFromTarget")
+        || target_event_matches(
+            event,
+            "Target.detachedFromTarget",
+            "sessionId",
+            Some(session_id),
+        )
+        || target_event_matches(event, "Target.targetDestroyed", "targetId", target_id)
+}
+
+struct ReplacementTarget {
+    target_id: String,
+    session_id: String,
+}
+
+fn choose_replacement_target(
+    targets: Vec<TargetInfo>,
+    current_target_id: Option<&str>,
+    browser_context_id: Option<&str>,
+) -> Option<TargetInfo> {
+    let candidates: Vec<TargetInfo> = targets
+        .into_iter()
+        .filter(should_track_target)
+        .filter(|target| {
+            current_target_id
+                .map(|id| target.target_id != id)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    candidates
+        .iter()
+        .find(|target| {
+            browser_context_id
+                .map(|context_id| target.browser_context_id.as_deref() == Some(context_id))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+async fn enable_recording_domains(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    client
+        .send_command_no_params("Page.enable", Some(session_id))
+        .await?;
+    client
+        .send_command_no_params("Runtime.enable", Some(session_id))
+        .await?;
+    let _ = client
+        .send_command_no_params("Runtime.runIfWaitingForDebugger", Some(session_id))
+        .await;
+    client
+        .send_command_no_params("Network.enable", Some(session_id))
+        .await?;
+    Ok(())
+}
+
+async fn attach_to_replacement_target(
+    client: &CdpClient,
+    current_target_id: Option<&str>,
+    browser_context_id: Option<&str>,
+) -> Result<ReplacementTarget, String> {
+    let result: GetTargetsResult = client
+        .send_command_typed("Target.getTargets", &json!({}), None)
+        .await?;
+
+    let target =
+        choose_replacement_target(result.target_infos, current_target_id, browser_context_id)
+            .ok_or_else(|| "No replacement page target found".to_string())?;
+
+    let attach: AttachToTargetResult = client
+        .send_command_typed(
+            "Target.attachToTarget",
+            &AttachToTargetParams {
+                target_id: target.target_id.clone(),
+                flatten: true,
+            },
+            None,
+        )
+        .await?;
+
+    enable_recording_domains(client, &attach.session_id).await?;
+    start_screencast(client, &attach.session_id).await?;
+
+    Ok(ReplacementTarget {
+        target_id: target.target_id,
+        session_id: attach.session_id,
+    })
+}
+
 async fn collect_screencast_frames(
     client: Arc<CdpClient>,
-    session_id: String,
+    mut session_id: String,
+    mut target_id: Option<String>,
+    browser_context_id: Option<String>,
     frame_tx: mpsc::UnboundedSender<ScreencastFrame>,
 ) {
     let mut event_rx = client.subscribe();
@@ -248,6 +364,21 @@ async fn collect_screencast_frames(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         };
+
+        if should_recover_recording_target(&event, &session_id, target_id.as_deref()) {
+            if let Ok(replacement) = attach_to_replacement_target(
+                &client,
+                target_id.as_deref(),
+                browser_context_id.as_deref(),
+            )
+            .await
+            {
+                session_id = replacement.session_id;
+                target_id = Some(replacement.target_id);
+                last_restart = Instant::now();
+            }
+            continue;
+        }
 
         if event
             .session_id
@@ -414,6 +545,8 @@ async fn write_realtime_padding(
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
     session_id: String,
+    target_id: Option<String>,
+    browser_context_id: Option<String>,
     output_path: String,
     shared_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
@@ -439,21 +572,32 @@ pub fn spawn_recording_task(
             tokio::time::interval(Duration::from_millis(1_000 / u64::from(CAPTURE_FPS)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let _ = client
-            .send_command_no_params("Page.stopScreencast", Some(&session_id))
-            .await;
+        let event_task = tokio::spawn(collect_screencast_frames(
+            Arc::clone(&client),
+            session_id.clone(),
+            target_id.clone(),
+            browser_context_id.clone(),
+            frame_tx.clone(),
+        ));
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_command_no_params("Page.stopScreencast", Some(&session_id)),
+        )
+        .await;
 
         if let Some(frame) = capture_screenshot_frame(&client, &session_id).await {
             let _ = frame_tx.send(frame);
         }
 
-        start_screencast(&client, &session_id).await?;
-
-        let event_task = tokio::spawn(collect_screencast_frames(
-            Arc::clone(&client),
-            session_id.clone(),
-            frame_tx,
-        ));
+        // Subscribe before starting screencast. Idle pages can emit a single
+        // initial frame immediately, and missing it leaves ffmpeg with no seed
+        // frame until the page changes again.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_screencast(&client, &session_id),
+        )
+        .await;
 
         loop {
             tokio::select! {

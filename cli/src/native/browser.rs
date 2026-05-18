@@ -106,6 +106,7 @@ fn update_page_target_info_in_pages(pages: &mut [PageInfo], target: &TargetInfo)
         page.url = target.url.clone();
         page.title = target.title.clone();
         page.target_type = target.target_type.clone();
+        page.browser_context_id = target.browser_context_id.clone();
         return true;
     }
     false
@@ -170,6 +171,7 @@ pub struct PageInfo {
     pub url: String,
     pub title: String,
     pub target_type: String, // "page" or "webview"
+    pub browser_context_id: Option<String>,
 }
 
 /// Canonical string form of a stable tab id: `t1`, `t2`, ... The `t` prefix
@@ -289,6 +291,23 @@ impl BrowserProcess {
             BrowserProcess::Lightpanda(_) => false,
         }
     }
+
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            BrowserProcess::Chrome(p) => Some(p.id()),
+            BrowserProcess::Lightpanda(_) => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn unix_pid_alive(_pid: u32) -> bool {
+    true
 }
 
 pub struct BrowserManager {
@@ -478,6 +497,7 @@ impl BrowserManager {
                 url: String::new(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                browser_context_id: None,
             });
             manager.active_page_index = 0;
             manager.enable_domains_direct().await?;
@@ -547,6 +567,7 @@ impl BrowserManager {
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                browser_context_id: None,
             });
             self.active_page_index = 0;
             self.enable_domains(&attach_result.session_id).await?;
@@ -574,6 +595,7 @@ impl BrowserManager {
                     url: target.url.clone(),
                     title: target.title.clone(),
                     target_type: target.target_type.clone(),
+                    browser_context_id: target.browser_context_id.clone(),
                 });
             }
 
@@ -829,10 +851,21 @@ impl BrowserManager {
         self.default_timeout_ms
     }
 
-    /// Checks if the CDP connection is alive by sending a simple command.
-    /// Returns false if the command times out or fails.
+    /// Checks whether the browser is healthy enough to keep using.
+    ///
+    /// For locally-launched Chrome, trust the OS process. A busy renderer can
+    /// stall `Browser.getVersion` long enough to cause false-negative relaunches,
+    /// which destroys authenticated page state during long-running workflows.
+    /// External CDP connections still need an active protocol probe because no
+    /// local process is available to inspect.
     pub async fn is_connection_alive(&self) -> bool {
-        let timeout = tokio::time::Duration::from_secs(3);
+        if let Some(process) = &self.browser_process {
+            if let Some(pid) = process.pid() {
+                return unix_pid_alive(pid);
+            }
+        }
+
+        let timeout = tokio::time::Duration::from_secs(5);
         let result = tokio::time::timeout(
             timeout,
             self.client
@@ -876,6 +909,12 @@ impl BrowserManager {
             .get(self.active_page_index)
             .map(|p| p.target_id.as_str())
             .ok_or_else(|| "No active page".to_string())
+    }
+
+    pub fn active_browser_context_id(&self) -> Option<String> {
+        self.pages
+            .get(self.active_page_index)
+            .and_then(|p| p.browser_context_id.clone())
     }
 
     /// Returns true if this manager was connected via CDP (as opposed to local launch).
@@ -923,6 +962,7 @@ impl BrowserManager {
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: None,
         });
         self.active_page_index = 0;
         self.enable_domains(&attach_result.session_id).await?;
@@ -1065,6 +1105,7 @@ impl BrowserManager {
             url: target_url.to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: None,
         });
         self.active_page_index = index;
 
@@ -1829,6 +1870,7 @@ mod tests {
             url: String::new(),
             title: String::new(),
             target_type: "page".to_string(),
+            browser_context_id: None,
         }];
         let target = TargetInfo {
             target_id: "popup-1".to_string(),

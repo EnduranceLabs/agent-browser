@@ -1067,6 +1067,7 @@ fn main() {
         || flags.download_path.is_some()
         || flags.engine.is_some()
         || !flags.extensions.is_empty())
+        && !daemon_result.already_running
         && flags.cdp.is_none()
         && flags.provider.is_none()
         && !flags.auto_connect
