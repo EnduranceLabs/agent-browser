@@ -21,6 +21,52 @@ fn default_browser_timeout_ms() -> u64 {
         .unwrap_or(25_000)
 }
 
+fn urls_equivalent(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+
+    let actual_trimmed = actual.trim_end_matches('/');
+    let expected_trimmed = expected.trim_end_matches('/');
+    if actual_trimmed == expected_trimmed {
+        return true;
+    }
+
+    match (url::Url::parse(actual), url::Url::parse(expected)) {
+        (Ok(actual), Ok(expected)) => {
+            actual.origin() == expected.origin()
+                && actual.path() == expected.path()
+                && actual.query() == expected.query()
+        }
+        _ => false,
+    }
+}
+
+fn event_url_matches(event: &CdpEvent, expected_url: &str) -> bool {
+    match event.method.as_str() {
+        "Page.frameNavigated" => {
+            let Some(frame) = event.params.get("frame") else {
+                return false;
+            };
+            let is_main = frame
+                .get("parentId")
+                .and_then(|v| v.as_str())
+                .is_none_or(|s| s.is_empty());
+            is_main
+                && frame
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|url| urls_equivalent(url, expected_url))
+        }
+        "Page.navigatedWithinDocument" => event
+            .params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|url| urls_equivalent(url, expected_url)),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Launch validation
 // ---------------------------------------------------------------------------
@@ -332,6 +378,7 @@ pub struct BrowserManager {
     pub ignore_https_errors: bool,
     /// Origins visited during this session, used by save_state to collect cross-origin localStorage.
     visited_origins: HashSet<String>,
+    closing_target_ids: HashSet<String>,
     next_tab_id: u32,
 }
 
@@ -404,6 +451,7 @@ impl BrowserManager {
                 download_path: download_path.clone(),
                 ignore_https_errors,
                 visited_origins: HashSet::new(),
+                closing_target_ids: HashSet::new(),
                 next_tab_id: 1,
             };
             manager.discover_and_attach_targets().await?;
@@ -493,6 +541,7 @@ impl BrowserManager {
             download_path: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
+            closing_target_ids: HashSet::new(),
             next_tab_id: 1,
         };
 
@@ -697,17 +746,31 @@ impl BrowserManager {
             }
         }
 
-        let nav_result: PageNavigateResult = self
+        let nav_result_value = self
             .client
-            .send_command_typed(
+            .send_command_with_timeout(
                 "Page.navigate",
-                &PageNavigateParams {
-                    url: url.to_string(),
-                    referrer: None,
-                },
+                Some(json!({ "url": url })),
                 Some(&session_id),
+                Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .or_else(|err| {
+                if err.contains("timed out") {
+                    Err("__NAVIGATE_TIMEOUT__".to_string())
+                } else {
+                    Err(err)
+                }
+            });
+
+        let nav_result: PageNavigateResult = match nav_result_value {
+            Ok(value) => serde_json::from_value(value)
+                .map_err(|e| format!("Failed to deserialize Page.navigate response: {}", e))?,
+            Err(err) if err == "__NAVIGATE_TIMEOUT__" => {
+                return self.navigate_in_fresh_target(url).await;
+            }
+            Err(err) => return Err(err),
+        };
 
         if let Some(ref error_text) = nav_result.error_text {
             return Err(format!("Navigation failed: {}", error_text));
@@ -717,7 +780,7 @@ impl BrowserManager {
         // If loader_id is None, it was a same-document navigation (e.g., hash routing)
         // which does not fire Page.loadEventFired or Page.domContentEventFired.
         if nav_result.loader_id.is_some() && wait_until != WaitUntil::None {
-            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+            self.wait_for_lifecycle_or_url(wait_until, &session_id, &mut lifecycle_rx, url)
                 .await?;
         }
 
@@ -740,6 +803,31 @@ impl BrowserManager {
         Ok(json!({ "url": page_url, "title": title }))
     }
 
+    pub async fn navigate_in_fresh_target(&mut self, url: &str) -> Result<Value, String> {
+        let old_index = self.active_page_index;
+        self.tab_new(Some(url), None).await?;
+
+        if self.pages.len() > 1 && old_index < self.pages.len() {
+            let old_page = self.pages.remove(old_index);
+            self.update_active_page_after_removal(old_index);
+            self.mark_target_closing(&old_page.target_id);
+            let _ = self
+                .client
+                .send_command_no_wait(
+                    "Target.closeTarget",
+                    Some(json!({ "targetId": old_page.target_id })),
+                    None,
+                )
+                .await;
+        }
+
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.url = url.to_string();
+        }
+
+        Ok(json!({ "url": url, "title": "" }))
+    }
+
     pub async fn navigate_via_location(
         &mut self,
         url: &str,
@@ -757,27 +845,23 @@ impl BrowserManager {
         let quoted_url = serde_json::to_string(url)
             .map_err(|e| format!("Failed to serialize navigation URL: {}", e))?;
         self.client
-            .send_command_with_timeout(
+            .send_command_no_wait(
                 "Runtime.evaluate",
                 Some(json!({
                     "expression": format!("window.location.assign({}); undefined", quoted_url),
                     "awaitPromise": false,
                 })),
                 Some(&session_id),
-                Duration::from_secs(3),
             )
             .await?;
 
         if wait_until != WaitUntil::None {
             let _ = self
-                .wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+                .wait_for_lifecycle_or_url(wait_until, &session_id, &mut lifecycle_rx, url)
                 .await;
         }
 
-        let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
-        let title = self.get_title().await.unwrap_or_default();
-
-        if let Ok(parsed) = url::Url::parse(&page_url) {
+        if let Ok(parsed) = url::Url::parse(url) {
             let origin = parsed.origin().ascii_serialization();
             if origin != "null" {
                 self.visited_origins.insert(origin);
@@ -785,11 +869,10 @@ impl BrowserManager {
         }
 
         if let Some(page) = self.pages.get_mut(self.active_page_index) {
-            page.url = page_url.clone();
-            page.title = title.clone();
+            page.url = url.to_string();
         }
 
-        Ok(json!({ "url": page_url, "title": title }))
+        Ok(json!({ "url": url, "title": "" }))
     }
 
     async fn wait_for_lifecycle(
@@ -825,6 +908,44 @@ impl BrowserManager {
         })
         .await
         .map_err(|_| format!("Timeout waiting for {}", event_name))?
+    }
+
+    async fn wait_for_lifecycle_or_url(
+        &self,
+        wait_until: WaitUntil,
+        session_id: &str,
+        rx: &mut broadcast::Receiver<CdpEvent>,
+        expected_url: &str,
+    ) -> Result<(), String> {
+        let event_name = match wait_until {
+            WaitUntil::Load => "Page.loadEventFired",
+            WaitUntil::DomContentLoaded => "Page.domContentEventFired",
+            WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
+            WaitUntil::None => return Ok(()),
+        };
+
+        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+
+        tokio::time::timeout(timeout, async {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if event.session_id.as_deref() != Some(session_id) {
+                            continue;
+                        }
+
+                        if event.method == event_name || event_url_matches(&event, expected_url) {
+                            return Ok(());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            Err("Event stream closed".to_string())
+        })
+        .await
+        .map_err(|_| format!("Timeout waiting for {} or URL {}", event_name, expected_url))?
     }
 
     async fn wait_for_network_idle(
@@ -1244,12 +1365,11 @@ impl BrowserManager {
         let closed_label = page.label.clone();
         let _ = self
             .client
-            .send_command_typed::<_, Value>(
+            .send_command_with_timeout(
                 "Target.closeTarget",
-                &CloseTargetParams {
-                    target_id: page.target_id,
-                },
+                Some(json!({ "targetId": page.target_id })),
                 None,
+                Duration::from_secs(1),
             )
             .await;
 
@@ -1551,6 +1671,14 @@ impl BrowserManager {
         update_page_target_info_in_pages(&mut self.pages, target)
     }
 
+    pub fn is_target_closing(&self, target_id: &str) -> bool {
+        self.closing_target_ids.contains(target_id)
+    }
+
+    pub fn mark_target_closing(&mut self, target_id: &str) {
+        self.closing_target_ids.insert(target_id.to_string());
+    }
+
     pub async fn active_session_is_responsive(&self, timeout: Duration) -> bool {
         let Ok(session_id) = self.active_session_id() else {
             return false;
@@ -1619,6 +1747,7 @@ impl BrowserManager {
     }
 
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
+        self.closing_target_ids.remove(target_id);
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             self.pages.remove(pos);
             self.update_active_page_after_removal(pos);
@@ -1798,6 +1927,7 @@ async fn initialize_lightpanda_manager(
             download_path: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
+            closing_target_ids: HashSet::new(),
             next_tab_id: 1,
         };
 

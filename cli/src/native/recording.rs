@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::browser::should_track_target;
 use super::cdp::client::CdpClient;
@@ -26,6 +26,8 @@ struct ScreencastFrame {
 
 struct EncodedFrame {
     bytes: Vec<u8>,
+    base64_data: String,
+    metadata: FrameMetadata,
     timestamp_secs: f64,
     frame_number: u64,
 }
@@ -79,11 +81,28 @@ impl RecordingState {
     }
 }
 
-#[derive(Default)]
 pub struct RecordingControl {
     paused: AtomicBool,
     restart_requested: AtomicBool,
+    capture_should_run: AtomicBool,
+    capture_suspended: AtomicBool,
+    capture_notify: Notify,
     screencast_session_id: Mutex<Option<String>>,
+    requested_target_id: Mutex<Option<String>>,
+}
+
+impl Default for RecordingControl {
+    fn default() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            restart_requested: AtomicBool::new(false),
+            capture_should_run: AtomicBool::new(true),
+            capture_suspended: AtomicBool::new(false),
+            capture_notify: Notify::new(),
+            screencast_session_id: Mutex::new(None),
+            requested_target_id: Mutex::new(None),
+        }
+    }
 }
 
 impl RecordingControl {
@@ -107,9 +126,75 @@ impl RecordingControl {
         self.restart_requested.swap(false, Ordering::SeqCst)
     }
 
+    pub async fn suspend_capture(&self, timeout: Duration) -> bool {
+        self.capture_should_run.store(false, Ordering::SeqCst);
+        self.capture_notify.notify_waiters();
+        let deadline = Instant::now() + timeout;
+
+        while Instant::now() < deadline {
+            if self.capture_suspended.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        self.capture_suspended.load(Ordering::SeqCst)
+    }
+
+    pub async fn resume_capture(&self, timeout: Duration) -> bool {
+        self.capture_should_run.store(true, Ordering::SeqCst);
+        self.capture_notify.notify_waiters();
+        let deadline = Instant::now() + timeout;
+
+        while Instant::now() < deadline {
+            if !self.capture_suspended.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        !self.capture_suspended.load(Ordering::SeqCst)
+    }
+
+    fn capture_should_run(&self) -> bool {
+        self.capture_should_run.load(Ordering::SeqCst)
+    }
+
+    fn set_capture_suspended(&self, suspended: bool) {
+        self.capture_suspended.store(suspended, Ordering::SeqCst);
+    }
+
+    fn is_capture_suspended(&self) -> bool {
+        self.capture_suspended.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_capture_change(&self) {
+        self.capture_notify.notified().await;
+    }
+
+    pub fn switch_capture_target(&self, target_id: String) {
+        if let Ok(mut guard) = self.requested_target_id.lock() {
+            *guard = Some(target_id);
+        }
+        self.capture_notify.notify_waiters();
+    }
+
+    fn take_requested_target_id(&self) -> Option<String> {
+        self.requested_target_id
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
     pub fn set_screencast_session_id(&self, session_id: String) {
         if let Ok(mut guard) = self.screencast_session_id.lock() {
             *guard = Some(session_id);
+        }
+    }
+
+    fn clear_screencast_session_id(&self) {
+        if let Ok(mut guard) = self.screencast_session_id.lock() {
+            *guard = None;
         }
     }
 
@@ -217,13 +302,36 @@ fn build_ffmpeg_command(output_path: &str) -> tokio::process::Command {
 }
 
 async fn start_screencast(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    let quality = env::var("AGENT_BROWSER_RECORDING_QUALITY")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(70);
+    let every_nth_frame = env::var("AGENT_BROWSER_RECORDING_EVERY_NTH_FRAME")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(6);
+    let max_width = env::var("AGENT_BROWSER_RECORDING_MAX_WIDTH")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1280);
+    let max_height = env::var("AGENT_BROWSER_RECORDING_MAX_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(720);
+
     client
         .send_command_with_timeout(
             "Page.startScreencast",
             Some(json!({
                 "format": "jpeg",
-                "quality": 80,
-                "everyNthFrame": 3,
+                "quality": quality,
+                "everyNthFrame": every_nth_frame,
+                "maxWidth": max_width,
+                "maxHeight": max_height,
             })),
             Some(session_id),
             Duration::from_secs(2),
@@ -388,16 +496,12 @@ fn choose_replacement_target(
 
 async fn enable_recording_domains(client: &CdpClient, session_id: &str) -> Result<(), String> {
     client
-        .send_command_no_params("Page.enable", Some(session_id))
-        .await?;
-    client
-        .send_command_no_params("Runtime.enable", Some(session_id))
-        .await?;
-    let _ = client
-        .send_command_no_params("Runtime.runIfWaitingForDebugger", Some(session_id))
-        .await;
-    client
-        .send_command_no_params("Network.enable", Some(session_id))
+        .send_command_with_timeout(
+            "Page.enable",
+            None,
+            Some(session_id),
+            Duration::from_secs(2),
+        )
         .await?;
     Ok(())
 }
@@ -454,9 +558,73 @@ async fn attach_recording_session(
     Ok(attach.session_id)
 }
 
+async fn detach_recording_session(client: &CdpClient, session_id: &str) {
+    let params = Some(json!({ "sessionId": session_id }));
+
+    if client
+        .send_command_with_timeout(
+            "Target.detachFromTarget",
+            params.clone(),
+            None,
+            Duration::from_millis(750),
+        )
+        .await
+        .is_err()
+    {
+        let _ = client
+            .send_command_no_wait("Target.detachFromTarget", params, None)
+            .await;
+    }
+}
+
+async fn suspend_recording_session(client: &CdpClient, session_id: &str) {
+    let _ = client
+        .send_command_with_timeout(
+            "Page.stopScreencast",
+            None,
+            Some(session_id),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    detach_recording_session(client, session_id).await;
+}
+
+async fn suspend_recording_session_no_wait(client: &CdpClient, session_id: &str) {
+    let _ = client
+        .send_command_no_wait("Page.stopScreencast", None, Some(session_id))
+        .await;
+    let _ = client
+        .send_command_no_wait(
+            "Target.detachFromTarget",
+            Some(json!({ "sessionId": session_id })),
+            None,
+        )
+        .await;
+}
+
+async fn attach_and_start_recording_session(
+    client: &CdpClient,
+    target_id: Option<&str>,
+    current_target_id: Option<&str>,
+    browser_context_id: Option<&str>,
+) -> Result<ReplacementTarget, String> {
+    if let Some(target_id) = target_id {
+        if let Ok(session_id) = attach_recording_session(client, Some(target_id)).await {
+            start_screencast(client, &session_id).await?;
+            return Ok(ReplacementTarget {
+                target_id: target_id.to_string(),
+                session_id,
+            });
+        }
+    }
+
+    attach_to_replacement_target(client, current_target_id, browser_context_id).await
+}
+
 async fn collect_screencast_frames(
     client: Arc<CdpClient>,
-    mut session_id: String,
+    initial_session_id: String,
     mut target_id: Option<String>,
     browser_context_id: Option<String>,
     frame_tx: mpsc::UnboundedSender<ScreencastFrame>,
@@ -464,15 +632,85 @@ async fn collect_screencast_frames(
     control: Arc<RecordingControl>,
 ) {
     let mut event_rx = client.subscribe();
+    let mut session_id = Some(initial_session_id);
+    control.set_capture_suspended(false);
+    if let Some(session_id) = session_id.as_deref() {
+        let _ = start_screencast(&client, session_id).await;
+    }
 
     loop {
-        let event = match event_rx.recv().await {
-            Ok(event) => event,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        if let Some(requested_target_id) = control.take_requested_target_id() {
+            if target_id.as_deref() != Some(requested_target_id.as_str()) {
+                if let Some(active_session_id) = session_id.take() {
+                    control.clear_screencast_session_id();
+                    suspend_recording_session_no_wait(&client, &active_session_id).await;
+                }
+                target_id = Some(requested_target_id);
+                control.set_capture_suspended(true);
+            }
+        }
+
+        if !control.capture_should_run() {
+            if let Some(active_session_id) = session_id.take() {
+                control.clear_screencast_session_id();
+                suspend_recording_session(&client, &active_session_id).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            control.set_capture_suspended(true);
+
+            tokio::select! {
+                _ = control.wait_for_capture_change() => continue,
+                event = event_rx.recv() => {
+                    match event {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+
+        if session_id.is_none() {
+            match attach_and_start_recording_session(
+                &client,
+                target_id.as_deref(),
+                target_id.as_deref(),
+                browser_context_id.as_deref(),
+            )
+            .await
+            {
+                Ok(replacement) => {
+                    control.set_screencast_session_id(replacement.session_id.clone());
+                    control.set_capture_suspended(false);
+                    session_id = Some(replacement.session_id);
+                    target_id = Some(replacement.target_id);
+                }
+                Err(_) => {
+                    control.set_capture_suspended(true);
+                    tokio::select! {
+                        _ = control.wait_for_capture_change() => continue,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => continue,
+                    }
+                }
+            }
+        }
+
+        let active_session_id = match session_id.clone() {
+            Some(session_id) => session_id,
+            None => continue,
         };
 
-        if should_recover_recording_target(&event, &session_id, target_id.as_deref()) {
+        let event = tokio::select! {
+            _ = control.wait_for_capture_change() => continue,
+            event = event_rx.recv() => {
+                match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+
+        if should_recover_recording_target(&event, &active_session_id, target_id.as_deref()) {
             if let Ok(replacement) = attach_to_replacement_target(
                 &client,
                 target_id.as_deref(),
@@ -480,7 +718,9 @@ async fn collect_screencast_frames(
             )
             .await
             {
-                session_id = replacement.session_id;
+                control.set_screencast_session_id(replacement.session_id.clone());
+                control.set_capture_suspended(false);
+                session_id = Some(replacement.session_id);
                 target_id = Some(replacement.target_id);
             }
             continue;
@@ -489,26 +729,20 @@ async fn collect_screencast_frames(
         if event
             .session_id
             .as_deref()
-            .is_some_and(|event_session_id| event_session_id != session_id)
+            .is_some_and(|event_session_id| event_session_id != active_session_id)
         {
             continue;
         }
 
-        if control.is_paused() {
-            // Page.screencastFrame is ACK-gated. Delaying ACKs while paused
-            // back-pressures Chrome during control commands without leaving
-            // the screencast permanently stalled after the command finishes.
-            if event.method == "Page.screencastFrame" {
-                if let Some(screencast_session_id) =
-                    event.params.get("sessionId").and_then(|v| v.as_i64())
-                {
-                    let ack_session_id = event
-                        .session_id
-                        .as_deref()
-                        .unwrap_or(&session_id)
-                        .to_string();
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    ack_screencast_frame(&client, &ack_session_id, screencast_session_id).await;
+        if is_main_frame_navigation_ready(&event) || event.method == "Page.frameStoppedLoading" {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            restart_screencast(&client, &active_session_id).await;
+            if let Some(frame) = capture_screenshot_frame(&client, &active_session_id).await {
+                if let Some(ref stream) = preview_stream {
+                    stream.broadcast_screencast_frame(&frame.base64_data, &frame.metadata);
+                }
+                if frame_tx.send(frame).is_err() {
+                    break;
                 }
             }
             continue;
@@ -524,7 +758,7 @@ async fn collect_screencast_frames(
             let ack_session_id = event
                 .session_id
                 .clone()
-                .unwrap_or_else(|| session_id.clone());
+                .unwrap_or_else(|| active_session_id.clone());
             tokio::spawn(async move {
                 ack_screencast_frame(&ack_client, &ack_session_id, screencast_session_id).await;
             });
@@ -644,11 +878,20 @@ async fn write_bytes(
     Ok(())
 }
 
+fn broadcast_encoded_frame(preview_stream: Option<&Arc<StreamServer>>, frame: &EncodedFrame) {
+    if let Some(stream) = preview_stream {
+        let mut metadata = frame.metadata.clone();
+        metadata.timestamp = (now_secs() * 1000.0) as u64;
+        stream.broadcast_screencast_frame(&frame.base64_data, &metadata);
+    }
+}
+
 async fn write_frame(
     stdin: &mut tokio::process::ChildStdin,
     writer: &mut FrameWriter,
     frame: ScreencastFrame,
     shared_count: &AtomicU64,
+    preview_stream: Option<&Arc<StreamServer>>,
 ) -> Result<(), String> {
     let first_timestamp_secs = match writer.first_timestamp_secs {
         Some(timestamp) => timestamp,
@@ -658,6 +901,8 @@ async fn write_frame(
             write_bytes(stdin, &frame.bytes, shared_count).await?;
             writer.last_frame = Some(EncodedFrame {
                 bytes: frame.bytes,
+                base64_data: frame.base64_data,
+                metadata: frame.metadata,
                 timestamp_secs: frame.timestamp_secs,
                 frame_number: 0,
             });
@@ -674,12 +919,15 @@ async fn write_frame(
         let repeat_count = frame_number.saturating_sub(last_frame.frame_number);
         for _ in 0..repeat_count {
             write_bytes(stdin, &last_frame.bytes, shared_count).await?;
+            broadcast_encoded_frame(preview_stream, last_frame);
         }
         encoded_frame_number = encoded_frame_number.max(last_frame.frame_number);
     }
 
     writer.last_frame = Some(EncodedFrame {
         bytes: frame.bytes,
+        base64_data: frame.base64_data,
+        metadata: frame.metadata,
         timestamp_secs: frame.timestamp_secs,
         frame_number: encoded_frame_number,
     });
@@ -692,6 +940,7 @@ async fn write_realtime_padding(
     writer: &mut FrameWriter,
     shared_count: &AtomicU64,
     extra_secs: f64,
+    preview_stream: Option<&Arc<StreamServer>>,
 ) -> Result<(), String> {
     let (Some(first_timestamp_secs), Some(first_frame_received_at)) =
         (writer.first_timestamp_secs, writer.first_frame_received_at)
@@ -709,6 +958,7 @@ async fn write_realtime_padding(
 
     for _ in 0..repeat_count {
         write_bytes(stdin, &last_frame.bytes, shared_count).await?;
+        broadcast_encoded_frame(preview_stream, last_frame);
     }
 
     if repeat_count > 0 {
@@ -780,7 +1030,14 @@ pub fn spawn_recording_task(
             if let Some(ref stream) = preview_stream {
                 stream.broadcast_screencast_frame(&frame.base64_data, &frame.metadata);
             }
-            write_frame(&mut stdin, &mut frame_writer, frame, shared_count.as_ref()).await?;
+            write_frame(
+                &mut stdin,
+                &mut frame_writer,
+                frame,
+                shared_count.as_ref(),
+                preview_stream.as_ref(),
+            )
+            .await?;
         }
 
         let event_task = if use_screencast {
@@ -796,7 +1053,6 @@ pub fn spawn_recording_task(
                 preview_stream.clone(),
                 control.clone(),
             ));
-            let _ = start_screencast(&client, &recording_session_id).await;
             task
         } else {
             tokio::spawn(collect_screenshot_frames(
@@ -812,15 +1068,36 @@ pub fn spawn_recording_task(
             tokio::select! {
                 _ = &mut cancel_rx => break,
                 Some(frame) = frame_rx.recv() => {
-                    if write_frame(&mut stdin, &mut frame_writer, frame, shared_count.as_ref()).await.is_err() {
+                    if write_frame(
+                        &mut stdin,
+                        &mut frame_writer,
+                        frame,
+                        shared_count.as_ref(),
+                        preview_stream.as_ref(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         break;
                     }
                 }
                 _ = interval.tick() => {
-                    if control.is_paused() {
+                    if control.is_capture_suspended() {
+                        if let Some(last_frame) = frame_writer.last_frame.as_ref() {
+                            broadcast_encoded_frame(preview_stream.as_ref(), last_frame);
+                        }
                         continue;
                     }
-                    if write_realtime_padding(&mut stdin, &mut frame_writer, shared_count.as_ref(), 0.0).await.is_err() {
+                    if write_realtime_padding(
+                        &mut stdin,
+                        &mut frame_writer,
+                        shared_count.as_ref(),
+                        0.0,
+                        preview_stream.as_ref(),
+                    )
+                    .await
+                    .is_err()
+                    {
                         break;
                     }
                 }
@@ -830,9 +1107,20 @@ pub fn spawn_recording_task(
         event_task.abort();
         let _ = event_task.await;
 
-        let _ = stop_recording_screencast(&client, &recording_session_id).await;
+        if let Some(session_id) = control.screencast_session_id() {
+            let _ = stop_recording_screencast(&client, &session_id).await;
+            detach_recording_session(&client, &session_id).await;
+            control.clear_screencast_session_id();
+        }
 
-        write_realtime_padding(&mut stdin, &mut frame_writer, shared_count.as_ref(), 1.0).await?;
+        write_realtime_padding(
+            &mut stdin,
+            &mut frame_writer,
+            shared_count.as_ref(),
+            1.0,
+            preview_stream.as_ref(),
+        )
+        .await?;
 
         drop(stdin);
 

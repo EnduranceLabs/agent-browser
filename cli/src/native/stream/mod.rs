@@ -140,21 +140,18 @@ impl StreamServer {
     /// Update and broadcast the recording state.
     pub async fn set_recording(&self, active: bool, engine: &str) {
         *self.recording.lock().await = active;
-        if active && *self.screencasting.lock().await {
+
+        if active {
+            self.client_notify.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
             let client = self.client_slot.read().await.clone();
             let session_id = self.cdp_session_id.read().await.clone();
-            if let Some(client) = client {
-                let _ = client
-                    .send_command_with_timeout(
-                        "Page.stopScreencast",
-                        None,
-                        session_id.as_deref(),
-                        std::time::Duration::from_secs(2),
-                    )
-                    .await;
+            if let (Some(client), Some(session_id)) = (client, session_id) {
+                let _ = cdp_loop::stop_screencast(client.as_ref(), &session_id).await;
             }
-            *self.screencasting.lock().await = false;
         }
+
         let connected = self.client_slot.read().await.is_some();
         let sc = *self.screencasting.lock().await;
         let (vw, vh) = self.viewport().await;

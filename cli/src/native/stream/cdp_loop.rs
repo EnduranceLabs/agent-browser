@@ -101,27 +101,6 @@ pub(super) async fn cdp_event_loop(
         let guard = client_slot.read().await;
 
         if count > 0 {
-            if *recording.lock().await {
-                if *screencasting.lock().await {
-                    let mut sc = screencasting.lock().await;
-                    *sc = false;
-                }
-                let eng = last_engine.read().await.clone();
-                let (vw, vh) = (*viewport_width.lock().await, *viewport_height.lock().await);
-                let status = json!({
-                    "type": "status",
-                    "connected": guard.is_some(),
-                    "screencasting": false,
-                    "viewportWidth": vw,
-                    "viewportHeight": vh,
-                    "engine": eng,
-                    "recording": true,
-                });
-                let _ = frame_tx.send(status.to_string());
-                drop(guard);
-                continue;
-            }
-
             if let Some(ref client) = *guard {
                 let mut event_rx = client.subscribe();
                 let client_arc = Arc::clone(client);
@@ -134,8 +113,13 @@ pub(super) async fn cdp_event_loop(
 
                 let eng = last_engine.read().await.clone();
                 let supports_screencast = eng == "chrome";
+                let rec = *recording.lock().await;
 
-                if supports_screencast {
+                // While recording is active, the recorder owns Page.startScreencast
+                // and forwards its frames to the preview stream. Starting a second
+                // screencast session for the same target can starve or stall Chrome's
+                // frame production in low-resource sandboxes.
+                if supports_screencast && !rec {
                     start_preview_screencast(&client_arc, session_id.as_deref(), vw, vh).await;
                 }
 
@@ -144,7 +128,6 @@ pub(super) async fn cdp_event_loop(
                     *sc = supports_screencast;
                 }
 
-                let rec = *recording.lock().await;
                 let status = json!({
                     "type": "status",
                     "connected": true,
@@ -169,21 +152,9 @@ pub(super) async fn cdp_event_loop(
                                 return;
                             }
                         }
-                        event = event_rx.recv() => {
+                        event = event_rx.recv(), if !rec => {
                             match event {
                                 Ok(evt) => {
-                                    if *recording.lock().await {
-                                        if evt.method == "Page.screencastFrame" {
-                                            // While recording, preview frames are supplied by
-                                            // the recorder. Do not ACK stream-server screencast
-                                            // frames here; ACKing keeps Chrome flooding CDP and
-                                            // can starve agent control commands.
-                                        }
-                                        let mut sc = screencasting.lock().await;
-                                        *sc = false;
-                                        client_notify.notify_one();
-                                        break;
-                                    }
                                     if evt.method == "Page.frameStoppedLoading" {
                                         if supports_screencast {
                                             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -321,15 +292,15 @@ pub(super) async fn cdp_event_loop(
                             let new_vw = *viewport_width.lock().await;
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
-                            let recording_active = *recording.lock().await;
+                            let recording_changed = *recording.lock().await != rec;
                             let screencast_stopped = !*screencasting.lock().await;
                             if client_changed
                                 || session_changed
                                 || viewport_changed
-                                || recording_active
+                                || recording_changed
                                 || screencast_stopped
                             {
-                                if supports_screencast && !recording_active {
+                                if supports_screencast {
                                     stop_preview_screencast(&client_arc, session_id.as_deref()).await;
                                 }
                                 let mut sc = screencasting.lock().await;

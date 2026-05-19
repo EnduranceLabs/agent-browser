@@ -752,6 +752,12 @@ impl DaemonState {
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
                                 if should_track_target(&te.target_info) {
+                                    let is_closing = self.browser.as_ref().is_some_and(|b| {
+                                        b.is_target_closing(&te.target_info.target_id)
+                                    });
+                                    if is_closing {
+                                        continue;
+                                    }
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -769,6 +775,12 @@ impl DaemonState {
                                 event.params.clone(),
                             ) {
                                 if should_track_target(&te.target_info) {
+                                    let is_closing = self.browser.as_ref().is_some_and(|b| {
+                                        b.is_target_closing(&te.target_info.target_id)
+                                    });
+                                    if is_closing {
+                                        continue;
+                                    }
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -1234,13 +1246,9 @@ async fn pause_recording_for_command(action: &str, state: &mut DaemonState) -> b
     };
 
     if recording_uses_screencast() {
-        control.pause();
-        if let Some(mgr) = state.browser.as_ref() {
-            if let Some(session_id) = control.screencast_session_id() {
-                let _ = recording::stop_recording_screencast(&mgr.client, &session_id).await;
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let _ = control
+            .suspend_capture(tokio::time::Duration::from_secs(3))
+            .await;
         return true;
     }
 
@@ -1258,18 +1266,16 @@ async fn resume_recording_after_command(action: &str, was_paused: bool, state: &
         return;
     };
 
-    control.resume();
-
     if recording_uses_screencast() {
         if state.recording_state.active {
-            if let Some(mgr) = state.browser.as_ref() {
-                if let Some(session_id) = control.screencast_session_id() {
-                    let _ = recording::start_recording_screencast(&mgr.client, &session_id).await;
-                }
-            }
+            let _ = control
+                .resume_capture(tokio::time::Duration::from_secs(3))
+                .await;
         }
         return;
     }
+
+    control.resume();
 
     let should_restart =
         !action_restarts_stream_screencast(action) || control.take_restart_requested();
@@ -2423,7 +2429,6 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     }
 
     let timeout_ms = state.timeout_ms(cmd);
-    let use_location_navigation = state.recording_state.active && recording_uses_screencast();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
     let wait_until = cmd
@@ -2478,21 +2483,45 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     state.iframe_sessions.clear();
     state.active_frame_id = None;
 
-    if use_location_navigation {
-        tokio::time::timeout(
+    if state.recording_state.active {
+        let recording_control = state.recording_state.control.clone();
+
+        let result = match tokio::time::timeout(
             tokio::time::Duration::from_millis(timeout_ms),
-            mgr.navigate_via_location(url, wait_until),
+            mgr.navigate_via_location(url, WaitUntil::None),
         )
         .await
-        .map_err(|_| format!("Navigation timed out after {}ms", timeout_ms))?
-    } else {
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(timeout_ms),
-            mgr.navigate(url, wait_until),
-        )
-        .await
-        .map_err(|_| format!("Navigation timed out after {}ms", timeout_ms))?
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(format!("Navigation timed out after {}ms", timeout_ms));
+            }
+        };
+
+        let settle_ms = env::var("AGENT_BROWSER_RECORDING_NAVIGATION_SETTLE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(2_000);
+        if settle_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
+        }
+
+        if let Some(control) = recording_control.as_ref() {
+            if let Ok(target_id) = mgr.active_target_id() {
+                control.switch_capture_target(target_id.to_string());
+            }
+        }
+
+        return Ok(result);
     }
+
+    tokio::time::timeout(
+        tokio::time::Duration::from_millis(timeout_ms),
+        mgr.navigate(url, wait_until),
+    )
+    .await
+    .map_err(|_| format!("Navigation timed out after {}ms", timeout_ms))?
 }
 
 async fn handle_url(state: &DaemonState) -> Result<Value, String> {
@@ -4275,14 +4304,26 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
             mgr.navigate(url, super::browser::WaitUntil::Load).await?;
         }
 
+        let use_active_recording_session = env::var("AGENT_BROWSER_RECORDING_USE_ACTIVE_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let recording_client = if use_active_recording_session {
+            Arc::clone(&mgr.client)
+        } else {
+            Arc::new(CdpClient::connect(mgr.get_cdp_url()).await?)
+        };
         let session_id = mgr.active_session_id()?.to_string();
         let target_id = mgr.active_target_id()?.to_string();
         let browser_context_id = mgr.active_browser_context_id();
 
         (
-            mgr.client.clone(),
+            recording_client,
             session_id,
-            Some(target_id),
+            if use_active_recording_session {
+                None
+            } else {
+                Some(target_id)
+            },
             browser_context_id,
         )
     };

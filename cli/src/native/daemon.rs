@@ -206,17 +206,21 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                if let Some(ref mut mgr) = s.browser {
-                    if mgr.has_process_exited() {
-                        let _ = mgr.close().await;
-                        s.browser = None;
-                        s.screencasting = false;
-                        s.update_stream_client().await;
-                    } else {
-                        s.drain_cdp_events_background().await;
+                if let Ok(mut s) = state.try_lock() {
+                    let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                        if let Some(ref mut mgr) = s.browser {
+                            if mgr.has_process_exited() {
+                                let _ = mgr.close().await;
+                                s.browser = None;
+                                s.screencasting = false;
+                                s.update_stream_client().await;
+                            } else {
+                                s.drain_cdp_events_background().await;
+                            }
+                        }
+                    })
+                    .await;
                     }
-                }
             }
             _ = async {
                 match idle_sleep_pin {
